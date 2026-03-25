@@ -130,6 +130,7 @@ private:
   void updateClientActivity(uint32_t clientId);
   void checkClientTimeouts();
   void sendHeartbeats();
+  void markClientDisconnected(uint32_t clientId, const std::string &reason);
   void sendToEndpoint(const udp::endpoint &endpoint, const std::string &topic,
                       const std::string &payload);
   void sendToEndpointBinary(const udp::endpoint &endpoint,
@@ -175,7 +176,7 @@ private:
   std::chrono::steady_clock::time_point _lastHeartbeatTime;
   std::chrono::steady_clock::time_point _lastTimeoutCheckTime;
   static constexpr auto HEARTBEAT_INTERVAL = std::chrono::seconds(1);
-  static constexpr auto CLIENT_TIMEOUT = std::chrono::seconds(5);
+  static constexpr auto CLIENT_TIMEOUT = std::chrono::seconds(3);
 
   struct ReliablePacket {
     uint32_t clientId = 0;

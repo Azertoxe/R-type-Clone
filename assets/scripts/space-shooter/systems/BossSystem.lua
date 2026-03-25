@@ -3,31 +3,69 @@ local Spawns = dofile("assets/scripts/space-shooter/spawns.lua")
 local BossSystem = {
     spawned = false,
     defeated = false,
-    spawnScoreThreshold = 1400
+    currentBossLevel = nil,
 }
-
-local function getGlobalScore()
-    local scoreEntities = ECS.getEntitiesWith({"Score"})
-    if #scoreEntities == 0 then return 0 end
-    local score = ECS.getComponent(scoreEntities[1], "Score")
-    return (score and score.value) or 0
-end
 
 local function hasBossEntity()
     local bosses = ECS.getEntitiesWith({"Boss", "Life", "Transform"})
     return #bosses > 0, bosses
 end
 
-local function spawnBossIfNeeded()
-    if BossSystem.spawned or BossSystem.defeated then return end
-    local currentLevel = _G.CurrentLevel or 1
-    if currentLevel < 2 then return end
+local function resetState()
+    BossSystem.spawned = false
+    BossSystem.defeated = false
+    BossSystem.currentBossLevel = nil
+end
 
-    if getGlobalScore() >= BossSystem.spawnScoreThreshold then
-        Spawns.spawnBoss(16, 0, 0)
-        BossSystem.spawned = true
-        print("[BossSystem] Boss spawned for level 2")
+local function configureBossForLevel(bossId, level)
+    local life = ECS.getComponent(bossId, "Life")
+    local transform = ECS.getComponent(bossId, "Transform")
+    local collider = ECS.getComponent(bossId, "Collider")
+    local boss = ECS.getComponent(bossId, "Boss")
+
+    local giantScale = 6.8 + (level - 1) * 1.6
+    local hp = 320 + (level - 1) * 240
+
+    if transform then
+        transform.sx = giantScale
+        transform.sy = giantScale
+        transform.sz = giantScale
+        ECS.addComponent(bossId, "Transform", transform)
     end
+
+    if collider then
+        collider.size = {giantScale * 0.75, giantScale * 0.75, giantScale * 0.75}
+        ECS.addComponent(bossId, "Collider", collider)
+    end
+
+    if life then
+        life.max = hp
+        life.amount = hp
+        ECS.addComponent(bossId, "Life", life)
+    end
+
+    if boss then
+        boss.phase = 1
+        boss.attackTimer = 0
+        boss.moveTimer = 0
+        ECS.addComponent(bossId, "Boss", boss)
+    end
+end
+
+local function spawnBossForLevel(level)
+    local hasBoss = hasBossEntity()
+    if hasBoss then
+        return
+    end
+
+    local bossId = Spawns.spawnBoss(16, 0, 0)
+    configureBossForLevel(bossId, level)
+
+    BossSystem.spawned = true
+    BossSystem.defeated = false
+    BossSystem.currentBossLevel = level
+
+    print("[BossSystem] Spawned giant boss for level " .. tostring(level))
 end
 
 local function updateBossPattern(bossId, dt)
@@ -37,6 +75,8 @@ local function updateBossPattern(bossId, dt)
     local life = ECS.getComponent(bossId, "Life")
     if not boss or not transform or not phys or not life then return end
 
+    local level = BossSystem.currentBossLevel or (_G.CurrentLevel or 1)
+
     boss.attackTimer = (boss.attackTimer or 0) + dt
     boss.moveTimer = (boss.moveTimer or 0) + dt
 
@@ -44,16 +84,19 @@ local function updateBossPattern(bossId, dt)
         boss.phase = 2
     end
 
-    phys.vx = (transform.x > 10) and -1.8 or 0
-    phys.vy = math.sin(boss.moveTimer * (boss.phase == 1 and 1.5 or 2.5)) * (boss.phase == 1 and 1.8 or 3.2)
+    local phaseSpeed = (boss.phase == 1) and 1.5 or 2.4
+    local verticalAmp = (boss.phase == 1) and (1.9 + level * 0.15) or (3.0 + level * 0.25)
 
-    local attackInterval = (boss.phase == 1) and 1.2 or 0.7
+    phys.vx = (transform.x > 10) and -1.6 or 0
+    phys.vy = math.sin(boss.moveTimer * phaseSpeed) * verticalAmp
+
+    local attackInterval = (boss.phase == 1) and math.max(0.8, 1.2 - level * 0.1) or math.max(0.45, 0.75 - level * 0.08)
     if boss.attackTimer >= attackInterval then
         boss.attackTimer = 0
-        Spawns.spawnBullet(transform.x - 1.5, transform.y, transform.z, true)
+        Spawns.spawnBullet(transform.x - 1.8, transform.y, transform.z, true)
         if boss.phase == 2 then
-            Spawns.spawnBullet(transform.x - 1.5, transform.y + 0.6, transform.z, true)
-            Spawns.spawnBullet(transform.x - 1.5, transform.y - 0.6, transform.z, true)
+            Spawns.spawnBullet(transform.x - 1.8, transform.y + 0.8, transform.z, true)
+            Spawns.spawnBullet(transform.x - 1.8, transform.y - 0.8, transform.z, true)
         end
     end
 
@@ -63,6 +106,16 @@ end
 
 function BossSystem.init()
     print("[BossSystem] Initialized")
+
+    ECS.subscribe("BOSS_SPAWN_REQUEST", function(msg)
+        if not ECS.capabilities.hasAuthority then return end
+        local level = tonumber(msg) or (_G.CurrentLevel or 1)
+        spawnBossForLevel(level)
+    end)
+
+    ECS.subscribe("RESET_BOSS_STATE", function(_)
+        resetState()
+    end)
 end
 
 function BossSystem.update(dt)
@@ -70,15 +123,24 @@ function BossSystem.update(dt)
     if not ECS.capabilities.hasAuthority then return end
     if not ECS.isGameRunning then return end
 
-    spawnBossIfNeeded()
-
     local hasBoss, bosses = hasBossEntity()
     if not hasBoss then
-        if BossSystem.spawned and not BossSystem.defeated then
+        if BossSystem.spawned and not BossSystem.defeated and BossSystem.currentBossLevel then
             BossSystem.defeated = true
-            ECS.broadcastNetworkMessage("GAME_WON", "boss_defeated")
-            ECS.sendMessage("GAME_WON", "boss_defeated")
-            print("[BossSystem] Boss defeated, game won")
+            local defeatedLevel = BossSystem.currentBossLevel
+            _G.LevelBossActive = false
+
+            if not _G.LevelBossDefeated then
+                _G.LevelBossDefeated = {}
+            end
+            _G.LevelBossDefeated[defeatedLevel] = true
+
+            ECS.sendMessage("BOSS_DEFEATED", tostring(defeatedLevel))
+            if ECS.capabilities.hasNetworkSync then
+                ECS.broadcastNetworkMessage("BOSS_DEFEATED", tostring(defeatedLevel))
+            end
+
+            print("[BossSystem] Giant boss defeated on level " .. tostring(defeatedLevel))
         end
         return
     end

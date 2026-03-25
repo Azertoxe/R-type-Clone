@@ -24,5 +24,6 @@ local Spawns = require("assets/scripts/space-shooter/spawns")
 
 
 Spawns.createCoreEntities(CurrentLevel, backgroundTexture, CurrentScore)
+ECS.sendMessage("ShowLevelIntro", "1")
 
 print("[Level-1] Level 1 entities loaded!")

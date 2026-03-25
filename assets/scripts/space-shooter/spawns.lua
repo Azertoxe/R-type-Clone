@@ -262,7 +262,7 @@ function Spawns.spawnBoss(x, y, z)
     local py = y or 0
     local pz = z or 0
 
-    ECS.addComponent(e, "Transform", Transform(px, py, pz, 0, 0, 0, 3.2, 3.2, 3.2))
+    ECS.addComponent(e, "Transform", Transform(px, py, pz, 0, 0, 0, 5.8, 5.8, 5.8))
     ECS.addComponent(e, "Tag", Tag({"Enemy", "Boss"}))
     ECS.addComponent(e, "Enemy", Enemy(3.0))
     ECS.addComponent(e, "Boss", Boss(300))

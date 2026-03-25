@@ -469,6 +469,21 @@ void NetworkManager::disconnect() {
 }
 
 void NetworkManager::disconnectInternal() {
+  if (!_isServer && _socket && _socket->is_open()) {
+    // Try to notify the server before closing so it can reset state immediately.
+    try {
+      NetworkEnvelope envelope{"_disconnect", "bye", 0};
+      msgpack::sbuffer buffer;
+      SerializableEnvelope wireEnvelope(envelope);
+      msgpack::pack(buffer, wireEnvelope);
+
+      std::error_code sendEc;
+      _socket->send(asio::buffer(buffer.data(), buffer.size()), 0, sendEc);
+    } catch (const std::exception &) {
+      // Best effort only; timeout heartbeat remains the fallback.
+    }
+  }
+
   if (_socket && _socket->is_open()) {
     std::error_code ec;
     _socket->close(ec);
@@ -545,6 +560,13 @@ void NetworkManager::processIncomingBuffer(
 
     if (_isServer && envelope.topic == "ACK") {
       handleAckMessage(clientId, envelope.payload);
+      return;
+    }
+
+    if (_isServer && envelope.topic == "_disconnect") {
+      if (clientId > 0) {
+        markClientDisconnected(clientId, "graceful");
+      }
       return;
     }
 
@@ -637,26 +659,56 @@ void NetworkManager::updateClientActivity(uint32_t clientId) {
 }
 
 void NetworkManager::checkClientTimeouts() {
-  std::lock_guard<std::mutex> lock(_clientsMutex);
-  auto now = std::chrono::steady_clock::now();
+  std::vector<uint32_t> timedOutClients;
+  {
+    std::lock_guard<std::mutex> lock(_clientsMutex);
+    auto now = std::chrono::steady_clock::now();
 
-  for (auto &[clientId, session] : _clients) {
-    if (session.connected && (now - session.lastActivity) >= CLIENT_TIMEOUT) {
-      session.connected = false;
-      _lobbyManager.onClientDisconnected(clientId);
-      queueBusMessage("ClientDisconnected",
-                      std::to_string(clientId) + " timeout");
-
-      std::lock_guard<std::mutex> reliableLock(_reliableMutex);
-      const std::string prefix = std::to_string(clientId) + ":";
-      for (auto it = _pendingReliablePackets.begin();
-           it != _pendingReliablePackets.end();) {
-        if (it->first.rfind(prefix, 0) == 0) {
-          it = _pendingReliablePackets.erase(it);
-        } else {
-          ++it;
-        }
+    for (auto &[clientId, session] : _clients) {
+      if (session.connected && (now - session.lastActivity) >= CLIENT_TIMEOUT) {
+        timedOutClients.push_back(clientId);
       }
+    }
+  }
+
+  for (uint32_t clientId : timedOutClients) {
+    markClientDisconnected(clientId, "timeout");
+  }
+}
+
+void NetworkManager::markClientDisconnected(uint32_t clientId,
+                                            const std::string &reason) {
+  bool wasConnected = false;
+
+  {
+    std::lock_guard<std::mutex> lock(_clientsMutex);
+    auto it = _clients.find(clientId);
+    if (it == _clients.end()) {
+      return;
+    }
+    if (!it->second.connected) {
+      return;
+    }
+    it->second.connected = false;
+    wasConnected = true;
+  }
+
+  if (!wasConnected) {
+    return;
+  }
+
+  _lobbyManager.onClientDisconnected(clientId);
+  queueBusMessage("ClientDisconnected",
+                  std::to_string(clientId) + " " + reason);
+
+  std::lock_guard<std::mutex> reliableLock(_reliableMutex);
+  const std::string prefix = std::to_string(clientId) + ":";
+  for (auto it = _pendingReliablePackets.begin();
+       it != _pendingReliablePackets.end();) {
+    if (it->first.rfind(prefix, 0) == 0) {
+      it = _pendingReliablePackets.erase(it);
+    } else {
+      ++it;
     }
   }
 }

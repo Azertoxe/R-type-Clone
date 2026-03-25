@@ -17,6 +17,12 @@ local menuButtons = {}      -- Button data for interaction
 local selectedIndex = 1
 local menuState = "MAIN"    -- MAIN, MULTIPLAYER, SETTINGS, PAUSE
 local isPaused = false
+local levelIntro = {
+    active = false,
+    timer = 0,
+    duration = 2.2,
+    elementIds = {}
+}
 
 ECS.isPaused = false
 
@@ -129,6 +135,7 @@ function MenuSystem.init()
     ECS.subscribe("WindowResized", MenuSystem.onWindowResized)
     ECS.subscribe("SET_GAME_MODE", MenuSystem.onSetGameMode)
     ECS.subscribe("GAME_START", MenuSystem.onGameStart)
+    ECS.subscribe("ShowLevelIntro", MenuSystem.onShowLevelIntro)
     _G.SCREEN_WIDTH = SCREEN_WIDTH
     _G.SCREEN_HEIGHT = SCREEN_HEIGHT
 
@@ -146,6 +153,55 @@ function MenuSystem.init()
     ECS.addComponent(menuCam, "Camera", Camera(90))
 
     MenuSystem.renderMenu()
+end
+
+local function clearLevelIntro()
+    if not levelIntro.active then
+        return
+    end
+    for _, id in ipairs(levelIntro.elementIds) do
+        ECS.destroyUI(id)
+    end
+    levelIntro.elementIds = {}
+    levelIntro.timer = 0
+    levelIntro.active = false
+end
+
+function MenuSystem.onShowLevelIntro(msg)
+    if not ECS.capabilities.hasRendering then
+        return
+    end
+
+    clearLevelIntro()
+
+    local level = tonumber(msg) or (_G.CurrentLevel or 1)
+    local centerX = SCREEN_WIDTH / 2
+    local centerY = SCREEN_HEIGHT / 2
+
+    local panelW = math.min(560, SCREEN_WIDTH - 80)
+    local panelH = 170
+    local panelX = centerX - panelW / 2
+    local panelY = centerY - panelH / 2
+
+    local panelId = ECS.createRoundedRect(panelX, panelY, panelW, panelH,
+        14, 0.04, 0.08, 0.16, 0.92, 80)
+    ECS.setOutline(panelId, true, 3, 0.3, 0.6, 0.95)
+    table.insert(levelIntro.elementIds, panelId)
+
+    local levelTitle = "LEVEL " .. tostring(level)
+    local titleWidth = estimateTextWidth(levelTitle, 52)
+    local titleId = ECS.createUIText(levelTitle, centerX - titleWidth / 2, centerY + 18,
+        52, 1.0, 0.9, 0.2, 81)
+    table.insert(levelIntro.elementIds, titleId)
+
+    local subtitle = "Destroy the giant boss to clear this level"
+    local subWidth = estimateTextWidth(subtitle, 18)
+    local subId = ECS.createUIText(subtitle, centerX - subWidth / 2, centerY - 36,
+        18, 0.88, 0.92, 1.0, 81)
+    table.insert(levelIntro.elementIds, subId)
+
+    levelIntro.active = true
+    levelIntro.timer = 0
 end
 
 -- ============================================================================
@@ -277,6 +333,9 @@ function MenuSystem.executeAction(action)
         ECS.isGameRunning = false
         isPaused = false
         ECS.isPaused = false
+        _G.LevelBossActive = false
+        _G.LevelBossDefeated = {}
+        ECS.sendMessage("RESET_BOSS_STATE", "")
         ECS.sendMessage("MusicStop", "bgm")
         -- Destroy game entities
         local allEntities = ECS.getEntitiesWith({"Transform"})
@@ -392,6 +451,9 @@ function MenuSystem.executeAction(action)
         ECS.isGameRunning = false
         isPaused = false
         ECS.isPaused = false
+        _G.LevelBossActive = false
+        _G.LevelBossDefeated = {}
+        ECS.sendMessage("RESET_BOSS_STATE", "")
 
         if #gsEntities > 0 then
             local gs = ECS.getComponent(gsEntities[1], "GameState")
@@ -455,6 +517,9 @@ function MenuSystem.onGameStart(_)
         ECS.sendMessage("MusicPlay", "bgm:music/background.ogg:40")
     end
     ECS.isGameRunning = true
+
+    local currentLevel = _G.CurrentLevel or 1
+    MenuSystem.onShowLevelIntro(tostring(currentLevel))
 end
 
 -- ============================================================================
@@ -739,7 +804,12 @@ end
 -- UPDATE (for animations if needed)
 -- ============================================================================
 function MenuSystem.update(dt)
-    -- Could add button hover animations, etc.
+    if levelIntro.active then
+        levelIntro.timer = levelIntro.timer + dt
+        if levelIntro.timer >= levelIntro.duration then
+            clearLevelIntro()
+        end
+    end
 end
 
 -- Register system
