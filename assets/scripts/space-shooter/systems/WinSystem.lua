@@ -18,6 +18,10 @@ function WinSystem.checkAndAdvanceLevel(currentScore)
         end
     end
 
+    if targetLevel > 2 then
+        targetLevel = 2
+    end
+
     if targetLevel > (_G.CurrentLevel or 1) then
         -- Destroy existing score text entities to avoid duplicates
         local existingScoreEntities = ECS.getEntitiesWith({"Score", "Transform", "Text"})

@@ -14,6 +14,7 @@ NetworkSystem.deathAnims = {} -- legacy, no longer used for effects
 NetworkSystem.broadcastTimer = 0
 NetworkSystem.broadcastInterval = 0.08
 NetworkSystem.readyClients = {}
+NetworkSystem.joinedClients = {}
 NetworkSystem.tickCounter = 0
 NetworkSystem.debugAccum = 0
 NetworkSystem.debugSentPlayers = 0
@@ -160,6 +161,32 @@ function NetworkSystem.init()
             end
         end)
 
+        ECS.subscribe("PLAYER_READY", function(msg)
+            local clientId = string.match(msg, "^(%d+)")
+            if not clientId then return end
+            NetworkSystem.readyClients[clientId] = true
+            print("[NetworkSystem] Lobby ready from client " .. clientId)
+        end)
+
+        ECS.subscribe("PLAYER_JOIN", function(msg)
+            local clientId = string.match(msg, "^(%d+)")
+            if not clientId then return end
+            NetworkSystem.joinedClients[clientId] = true
+            print("[NetworkSystem] Lobby join from client " .. clientId)
+        end)
+
+        ECS.subscribe("GAME_START", function(msg)
+            print("[NetworkSystem] GAME_START received from lobby manager")
+            local gameStateEntities = ECS.getEntitiesWith({"GameState"})
+            if #gameStateEntities > 0 then
+                local gameState = ECS.getComponent(gameStateEntities[1], "GameState")
+                if gameState.state ~= "PLAYING" then
+                    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
+                    gameState.lastScore = 0
+                end
+            end
+        end)
+
         ECS.subscribe("RESET_GAME", function(msg)
             print("DEBUG SERVER: Reset Game Requested")
             -- Full reset: clear arena and all players/clients to mirror solo restart.
@@ -245,6 +272,7 @@ function NetworkSystem.init()
                      ECS.destroyEntity(playerId)
                      NetworkSystem.clientEntities[clientId] = nil
                      NetworkSystem.readyClients[clientId] = nil
+                     NetworkSystem.joinedClients[clientId] = nil
                      print("Client Disconnected: " .. clientId)
 
                      -- When the last client leaves, reset game state for next session
@@ -316,6 +344,9 @@ function NetworkSystem.init()
     elseif not ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
         print("[NetworkSystem] Client Mode - Receiving Network Sync")
 
+        -- Explicitly join lobby once network mode is ready.
+        ECS.sendNetworkMessage("PLAYER_JOIN", "join")
+
         -- Handle sound events broadcast from server
         ECS.subscribe("PLAY_SOUND", function(msg)
             -- msg format: "soundId:path:volume"
@@ -344,9 +375,19 @@ function NetworkSystem.init()
                 print(">> Assigned Player ID: " .. id)
                 NetworkSystem.myServerId = id
                 NetworkSystem.updateLocalEntity(id, -8, 0, 0, 0, 0, 0, 0, 0, 0, "1")
+                ECS.sendNetworkMessage("ACK", "PLAYER_ASSIGN")
                 -- Send a ready ping; network layer will prefix client id.
-                ECS.sendNetworkMessage("CLIENT_READY", "ready")
-                ECS.isGameRunning = true
+                ECS.sendNetworkMessage("PLAYER_READY", "ready")
+            end
+        end)
+
+        ECS.subscribe("GAME_START", function(msg)
+            print("[NetworkSystem][Client] GAME_START received")
+            ECS.sendNetworkMessage("ACK", "GAME_START")
+            ECS.isGameRunning = true
+            -- Ensure we have a player assignment in case packet ordering changed.
+            if not NetworkSystem.myServerId then
+                ECS.sendNetworkMessage("REQUEST_SPAWN", "1")
             end
         end)
 
@@ -544,6 +585,12 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
             ECS.addComponent(localId, "Color", Color(1.0, 0.5, 0.0)) -- Orange
             local t = ECS.getComponent(localId, "Transform")
             t.sx = 0.2; t.sy = 0.2; t.sz = 0.2
+        elseif nType == 99 then
+            ECS.addComponent(localId, "Mesh", Mesh("assets/models/Monster_3/motion_1.obj", nil))
+            ECS.addComponent(localId, "Color", Color(0.9, 0.1, 0.1))
+            ECS.addComponent(localId, "Animation", Animation(8, 0.15, true, "assets/models/Monster_3/motion_"))
+            local t = ECS.getComponent(localId, "Transform")
+            t.sx = 0.55; t.sy = 0.55; t.sz = 0.55
         elseif nType >= 4 then
             local configIndex = nType - 3
             local enemyConfigs = {
@@ -557,6 +604,7 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
 
             local animBase = "assets/models/Monster_" .. configIndex .. "/motion_"
             ECS.addComponent(localId, "Animation", Animation(cfg.frames, 0.2, true, animBase))
+            local t = ECS.getComponent(localId, "Transform")
             t.sx = 0.2; t.sy = 0.2; t.sz = 0.2
         end
         NetworkSystem.serverEntities[serverId] = localId

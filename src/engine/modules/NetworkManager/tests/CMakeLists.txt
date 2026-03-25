@@ -6,6 +6,8 @@ add_executable(NetworkManagerTests
     NetworkManagerTests.cpp
     ../NetworkManager.cpp # Compiling source directly; tests use only the public interface (black-box testing)
     ../NetworkManager.hpp
+    ../LobbyManager.cpp
+    ../LobbyManager.hpp
     ../../AModule.cpp
 )
 

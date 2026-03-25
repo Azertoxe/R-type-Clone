@@ -124,6 +124,13 @@ function CollisionSystem.onCollision(id1, id2)
 elseif CollisionSystem.hasTag(id2, "Player") and CollisionSystem.hasTag(id1, "Bonus") then
         CollisionSystem.handlePlayerBonus(id2, id1)
     end
+
+    -- Check Player vs PowerUp (new explicit tag)
+    if CollisionSystem.hasTag(id1, "Player") and CollisionSystem.hasTag(id2, "PowerUp") then
+        CollisionSystem.handlePlayerBonus(id1, id2)
+    elseif CollisionSystem.hasTag(id2, "Player") and CollisionSystem.hasTag(id1, "PowerUp") then
+        CollisionSystem.handlePlayerBonus(id2, id1)
+    end
 end
 
 function CollisionSystem.handlePlayerEnemy(playerId, enemyId)
@@ -172,8 +179,14 @@ function CollisionSystem.handleEnemyBullet(enemyId, bulletId)
     -- ⚠️ AUTHORITY: Only server/solo modifies life and score
     local life = ECS.getComponent(enemyId, "Life")
     if life then
-        -- DAMAGE APPLICATION: Kill enemy on bullet hit
-        life.amount = 0
+        local bulletComp = ECS.getComponent(bulletId, "Bullet")
+        local damage = (bulletComp and bulletComp.damage) or 1
+        if CollisionSystem.hasTag(enemyId, "Boss") then
+            life.amount = life.amount - damage
+        else
+            -- Keep fast clear for normal enemies.
+            life.amount = 0
+        end
         
         -- Play explosion sound
         if not ECS.capabilities.hasNetworkSync then
@@ -213,7 +226,14 @@ function CollisionSystem.handlePlayerBonus(playerId, bonusId)
     -- ⚠️ AUTHORITY: Only server/solo can grant powerups and destroy bonus
     local bonus = ECS.getComponent(bonusId, "Bonus")
     if bonus then
-        ECS.addComponent(playerId, "PowerUp", PowerUp(bonus.duration, 0.2))
+        local duration = bonus.duration or 8.0
+        local pType = bonus.type or "RAPID"
+
+        if PowerUpSystem and PowerUpSystem.applyPowerUp then
+            PowerUpSystem.applyPowerUp(playerId, pType, duration)
+        else
+            ECS.addComponent(playerId, "PowerUp", { timeRemaining = duration, originalCooldown = 0.2, powerType = pType })
+        end
         
         -- Play powerup sound
         if not ECS.capabilities.hasNetworkSync then

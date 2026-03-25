@@ -15,7 +15,7 @@ local isMenuRendered = false
 local menuElements = {}     -- All UI element IDs for cleanup
 local menuButtons = {}      -- Button data for interaction
 local selectedIndex = 1
-local menuState = "MAIN"    -- MAIN, SETTINGS, PAUSE
+local menuState = "MAIN"    -- MAIN, MULTIPLAYER, SETTINGS, PAUSE
 local isPaused = false
 
 ECS.isPaused = false
@@ -128,6 +128,7 @@ function MenuSystem.init()
     ECS.subscribe("RESUME_GAME", MenuSystem.hidePauseMenu)
     ECS.subscribe("WindowResized", MenuSystem.onWindowResized)
     ECS.subscribe("SET_GAME_MODE", MenuSystem.onSetGameMode)
+    ECS.subscribe("GAME_START", MenuSystem.onGameStart)
     _G.SCREEN_WIDTH = SCREEN_WIDTH
     _G.SCREEN_HEIGHT = SCREEN_HEIGHT
 
@@ -320,17 +321,16 @@ function MenuSystem.executeAction(action)
 
     elseif action == "MULTI" then
         cleanStart()
-        if #gsEntities > 0 then
-            local gs = ECS.getComponent(gsEntities[1], "GameState")
-            gs.state = "PLAYING"
-        end
-
-        MenuSystem.hideMenu()
         ECS.setGameMode("MULTI_CLIENT")
-        ECS.sendMessage("MusicPlay", "bgm:music/background.ogg:40")
+        MenuSystem.showMultiplayerMenu()
+        ECS.sendNetworkMessage("PLAYER_JOIN", "join")
 
-        print("[MenuSystem] Sending REQUEST_GAME_START to server...")
-        ECS.sendNetworkMessage("REQUEST_GAME_START", "1")
+    elseif action == "READY" then
+        ECS.sendNetworkMessage("PLAYER_READY", "ready")
+        print("[MenuSystem] Player marked ready, waiting for GAME_START")
+
+    elseif action == "START_FROM_LOBBY" then
+        ECS.sendNetworkMessage("PLAYER_READY", "ready")
 
     elseif action == "SETTINGS" then
         MenuSystem.showSettings()
@@ -411,6 +411,50 @@ function MenuSystem.executeAction(action)
         MenuSystem.hideMenu()
         MenuSystem.renderMenu()
     end
+end
+
+function MenuSystem.showMultiplayerMenu()
+    MenuSystem.hideMenu()
+    isMenuRendered = true
+    menuElements = {}
+    menuButtons = {}
+    selectedIndex = 1
+    menuState = "MULTIPLAYER"
+
+    local bgId = ECS.createRoundedRect(20, 20, SCREEN_WIDTH - 40, SCREEN_HEIGHT - 40,
+        15, COLORS.background.r, COLORS.background.g, COLORS.background.b, COLORS.background.a, 0)
+    table.insert(menuElements, bgId)
+    ECS.setOutline(bgId, true, 3, 0.2, 0.4, 0.6)
+
+    createCenteredLabel("MULTIPLAYER LOBBY", SCREEN_HEIGHT - 120, 42, COLORS.title, 20)
+    createCenteredLabel("Connect all clients, then press READY", SCREEN_HEIGHT - 170, 18, COLORS.textNormal, 20)
+    createCenteredLabel("Game starts automatically when everyone is ready", SCREEN_HEIGHT - 200, 16, COLORS.textNormal, 20)
+
+    local btnWidth = 260
+    local btnHeight = 50
+    MenuSystem.createButton("READY", "READY", SCREEN_WIDTH / 2 - btnWidth / 2, SCREEN_HEIGHT / 2 - 20,
+        btnWidth, btnHeight, COLORS.multi, 26, 10)
+    MenuSystem.createButton("BACK", "BACK", SCREEN_WIDTH / 2 - btnWidth / 2, SCREEN_HEIGHT / 2 - 90,
+        btnWidth, btnHeight, COLORS.quit, 24, 10)
+
+    MenuSystem.updateSelection()
+end
+
+function MenuSystem.onGameStart(_)
+    local gsEntities = ECS.getEntitiesWith({"GameState"})
+    if #gsEntities > 0 then
+        local gs = ECS.getComponent(gsEntities[1], "GameState")
+        gs.state = "PLAYING"
+    end
+
+    if ECS.capabilities.hasRendering and isMenuRendered then
+        MenuSystem.hideMenu()
+    end
+
+    if ECS.capabilities.hasRendering then
+        ECS.sendMessage("MusicPlay", "bgm:music/background.ogg:40")
+    end
+    ECS.isGameRunning = true
 end
 
 -- ============================================================================

@@ -28,6 +28,7 @@ function Spawns.createPlayer(x, y, z, clientId)
     ECS.addComponent(e, "Collider", Collider("BOX", {s, s, s}))
     ECS.addComponent(e, "Player", Player(config.player.speed))
     ECS.addComponent(e, "Weapon", Weapon(0.2))
+    ECS.addComponent(e, "WeaponProfile", WeaponProfile("STANDARD", config.player.weaponCooldown or 0.2))
     ECS.addComponent(e, "Life", Life(100))
     ECS.addComponent(e, "Score", Score(0))
     -- 2. Input & Logic
@@ -218,6 +219,64 @@ function Spawns.spawnBullet(x, y, z, isEnemy, ownerId)
 
     -- Network
     ECS.addComponent(e, "NetworkIdentity", NetworkIdentity(e, -1, false))
+    if hasAuthority() then
+        ECS.addComponent(e, "ServerAuthority", ServerAuthority())
+    end
+
+    return e
+end
+
+function Spawns.spawnPowerUp(x, y, z, powerType)
+    local e = ECS.createEntity()
+    local pickedType = powerType or "RAPID"
+
+    ECS.addComponent(e, "Transform", Transform(x, y, z, 0, 0, 0, 0.7, 0.7, 0.7))
+    ECS.addComponent(e, "Tag", Tag({"PowerUp", "Bonus"}))
+    ECS.addComponent(e, "Collider", Collider("BOX", {0.7, 0.7, 0.7}))
+    ECS.addComponent(e, "Physic", Physic(0.1, 0.0, true, false))
+    ECS.addComponent(e, "Life", Life(1))
+    ECS.addComponent(e, "Bonus", { duration = 8.0, type = pickedType })
+
+    local phys = ECS.getComponent(e, "Physic")
+    phys.vx = -2.8
+
+    if hasRendering() then
+        ECS.addComponent(e, "Mesh", Mesh("assets/models/cube.obj", nil))
+        if pickedType == "SPREAD" then
+            ECS.addComponent(e, "Color", Color(1.0, 0.8, 0.0))
+        else
+            ECS.addComponent(e, "Color", Color(0.2, 0.8, 1.0))
+        end
+    end
+
+    if hasAuthority() then
+        ECS.addComponent(e, "ServerAuthority", ServerAuthority())
+    end
+
+    return e
+end
+
+function Spawns.spawnBoss(x, y, z)
+    local e = ECS.createEntity()
+    local px = x or 16
+    local py = y or 0
+    local pz = z or 0
+
+    ECS.addComponent(e, "Transform", Transform(px, py, pz, 0, 0, 0, 3.2, 3.2, 3.2))
+    ECS.addComponent(e, "Tag", Tag({"Enemy", "Boss"}))
+    ECS.addComponent(e, "Enemy", Enemy(3.0))
+    ECS.addComponent(e, "Boss", Boss(300))
+    ECS.addComponent(e, "Life", Life(300))
+    ECS.addComponent(e, "Collider", Collider("BOX", {2.2, 2.2, 2.2}))
+    ECS.addComponent(e, "Physic", Physic(10.0, 0.0, true, false))
+    ECS.addComponent(e, "EnemyType", { type = 99 })
+
+    if hasRendering() then
+        ECS.addComponent(e, "Mesh", Mesh("assets/models/Monster_3/motion_1.obj", nil))
+        ECS.addComponent(e, "Color", Color(0.9, 0.1, 0.1))
+        ECS.addComponent(e, "Animation", Animation(8, 0.15, true, "assets/models/Monster_3/motion_"))
+    end
+
     if hasAuthority() then
         ECS.addComponent(e, "ServerAuthority", ServerAuthority())
     end

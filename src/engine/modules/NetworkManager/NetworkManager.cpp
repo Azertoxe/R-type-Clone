@@ -59,11 +59,12 @@ namespace rtypeEngine {
 
 NetworkManager::NetworkManager(const char *pubEndpoint, const char *subEndpoint)
     : AModule(pubEndpoint, subEndpoint), _workGuard(nullptr), _socket(nullptr),
-      _ioThreadRunning(false), _isServer(false) {
+      _ioThreadRunning(false), _isServer(false), _lobbyManager(2) {
   auto now = std::chrono::steady_clock::now();
   _lastHeartbeatTime = now;
   _lastTimeoutCheckTime = now;
   _lastOverflowLog = now;
+  _lastReliableCheckTime = now;
 }
 
 NetworkManager::~NetworkManager() { cleanup(); }
@@ -99,6 +100,11 @@ void NetworkManager::loop() {
     if (now - _lastTimeoutCheckTime >= std::chrono::seconds(1)) {
       checkClientTimeouts();
       _lastTimeoutCheckTime = now;
+    }
+
+    if (now - _lastReliableCheckTime >= RELIABLE_RESEND_INTERVAL) {
+      processReliableResends();
+      _lastReliableCheckTime = now;
     }
   }
 
@@ -469,10 +475,14 @@ void NetworkManager::disconnectInternal() {
   }
   _socket.reset();
   _isServer = false;
+  _lobbyManager.setGameStarted(false);
 
   std::lock_guard<std::mutex> lock(_clientsMutex);
   _clients.clear();
   _endpointToClientId.clear();
+
+  std::lock_guard<std::mutex> reliableLock(_reliableMutex);
+  _pendingReliablePackets.clear();
 }
 
 void NetworkManager::startReceive() {
@@ -533,7 +543,34 @@ void NetworkManager::processIncomingBuffer(
       return;
     }
 
+    if (_isServer && envelope.topic == "ACK") {
+      handleAckMessage(clientId, envelope.payload);
+      return;
+    }
+
+    bool suppressDefaultBusForward = false;
+    if (_isServer) {
+      if (envelope.topic == "PLAYER_JOIN") {
+        _lobbyManager.onPlayerJoin(clientId);
+        queueBusMessage("PLAYER_JOIN", std::to_string(clientId));
+        suppressDefaultBusForward = true;
+      } else if (envelope.topic == "PLAYER_READY") {
+        _lobbyManager.onPlayerReady(clientId);
+        queueBusMessage("PLAYER_READY", std::to_string(clientId));
+        suppressDefaultBusForward = true;
+        if (_lobbyManager.shouldStartGame()) {
+          _lobbyManager.setGameStarted(true);
+          broadcast("GAME_START", "all_ready");
+          queueBusMessage("GAME_START", "all_ready");
+        }
+      }
+    }
+
     enqueueMessage(envelope);
+
+    if (suppressDefaultBusForward) {
+      return;
+    }
 
     if (_isServer && clientId > 0) {
       queueBusMessage(envelope.topic,
@@ -573,6 +610,7 @@ uint32_t NetworkManager::getOrCreateClientId(const udp::endpoint &endpoint) {
 
   // Notify about new client
   if (isNewClient) {
+    _lobbyManager.onClientConnected(clientId);
     queueBusMessage("ClientConnected", std::to_string(clientId) + " " + key);
   }
 
@@ -605,8 +643,20 @@ void NetworkManager::checkClientTimeouts() {
   for (auto &[clientId, session] : _clients) {
     if (session.connected && (now - session.lastActivity) >= CLIENT_TIMEOUT) {
       session.connected = false;
+      _lobbyManager.onClientDisconnected(clientId);
       queueBusMessage("ClientDisconnected",
                       std::to_string(clientId) + " timeout");
+
+      std::lock_guard<std::mutex> reliableLock(_reliableMutex);
+      const std::string prefix = std::to_string(clientId) + ":";
+      for (auto it = _pendingReliablePackets.begin();
+           it != _pendingReliablePackets.end();) {
+        if (it->first.rfind(prefix, 0) == 0) {
+          it = _pendingReliablePackets.erase(it);
+        } else {
+          ++it;
+        }
+      }
     }
   }
 }
@@ -780,6 +830,9 @@ void NetworkManager::sendToClient(uint32_t clientId, const std::string &topic,
   }
 
   if (endpointOpt.has_value()) {
+    if (_isServer && isReliableTopic(topic)) {
+      trackReliableMessage(clientId, topic, payload);
+    }
     sendToEndpoint(endpointOpt.value(), topic, payload);
   }
 }
@@ -814,6 +867,7 @@ void NetworkManager::sendToClientBinary(uint32_t clientId,
 
 void NetworkManager::broadcast(const std::string &topic,
                                const std::string &payload) {
+  std::vector<uint32_t> reliableClients;
   std::vector<udp::endpoint> endpoints;
   {
     std::lock_guard<std::mutex> lock(_clientsMutex);
@@ -823,12 +877,19 @@ void NetworkManager::broadcast(const std::string &topic,
     for (const auto &[clientId, session] : _clients) {
       if (session.connected) {
         endpoints.push_back(session.endpoint);
+        reliableClients.push_back(clientId);
       }
     }
   }
 
   for (const auto &endpoint : endpoints) {
     sendToEndpoint(endpoint, topic, payload);
+  }
+
+  if (_isServer && isReliableTopic(topic)) {
+    for (uint32_t clientId : reliableClients) {
+      trackReliableMessage(clientId, topic, payload);
+    }
   }
 }
 
@@ -897,6 +958,76 @@ std::vector<NetworkEnvelope> NetworkManager::getAllMessages() {
     _messageQueue.pop_front();
   }
   return messages;
+}
+
+bool NetworkManager::isReliableTopic(const std::string &topic) const {
+  return topic == "PLAYER_ASSIGN" || topic == "GAME_START";
+}
+
+void NetworkManager::trackReliableMessage(uint32_t clientId,
+                                          const std::string &topic,
+                                          const std::string &payload) {
+  std::lock_guard<std::mutex> lock(_reliableMutex);
+  const auto key = std::to_string(clientId) + ":" + topic;
+  auto &packet = _pendingReliablePackets[key];
+  packet.clientId = clientId;
+  packet.topic = topic;
+  packet.payload = payload;
+  packet.lastSent = std::chrono::steady_clock::now();
+  packet.attempts = 1;
+}
+
+void NetworkManager::handleAckMessage(uint32_t clientId,
+                                      const std::string &payload) {
+  const std::string topic = trimString(payload);
+  if (topic.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(_reliableMutex);
+  const auto key = std::to_string(clientId) + ":" + topic;
+  _pendingReliablePackets.erase(key);
+}
+
+void NetworkManager::processReliableResends() {
+  std::vector<ReliablePacket> toResend;
+  std::vector<std::string> toErase;
+  const auto now = std::chrono::steady_clock::now();
+
+  {
+    std::lock_guard<std::mutex> lock(_reliableMutex);
+    for (auto &[key, packet] : _pendingReliablePackets) {
+      if (now - packet.lastSent < RELIABLE_RESEND_INTERVAL) {
+        continue;
+      }
+      if (packet.attempts >= RELIABLE_MAX_ATTEMPTS) {
+        toErase.push_back(key);
+        publishError("ReliableMessageTimeout:" + key);
+        continue;
+      }
+      packet.lastSent = now;
+      packet.attempts += 1;
+      toResend.push_back(packet);
+    }
+
+    for (const auto &key : toErase) {
+      _pendingReliablePackets.erase(key);
+    }
+  }
+
+  for (const auto &packet : toResend) {
+    std::optional<udp::endpoint> endpointOpt;
+    {
+      std::lock_guard<std::mutex> clientsLock(_clientsMutex);
+      auto it = _clients.find(packet.clientId);
+      if (it != _clients.end() && it->second.connected) {
+        endpointOpt = it->second.endpoint;
+      }
+    }
+    if (endpointOpt.has_value()) {
+      sendToEndpoint(endpointOpt.value(), packet.topic, packet.payload);
+    }
+  }
 }
 
 } // namespace rtypeEngine
