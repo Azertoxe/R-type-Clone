@@ -3,12 +3,33 @@
 #include <thread>
 #include <chrono>
 
+#ifdef _WIN32
+    #include <process.h>
+#else
+    #include <unistd.h>
+#endif
+
 namespace rtypeGame {
+
+namespace {
+int processId() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
+}
+} // namespace
 
 RTypeClient::RTypeClient(bool isLocal, const std::string& serverIp, int serverPort)
     : RTypeGame(), _isLocal(isLocal), _serverIp(serverIp), _serverPort(serverPort) {
-
+#ifdef _WIN32
     setupBroker("127.0.0.1:*", true);
+#else
+    // Use an IPC namespace bound to PID so each local client process has an isolated bus.
+    const std::string busNamespace = "ipc:///tmp/rtype-client-bus-" + std::to_string(processId());
+    setupBroker(busNamespace, true);
+#endif
 }
 
 void RTypeClient::onInit() {

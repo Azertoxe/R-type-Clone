@@ -2,6 +2,7 @@
 #include "AApplication.hpp"
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept> // For std::stoi
 #include <string>
@@ -17,6 +18,20 @@ std::string truncatePayload(const std::string& msg, std::size_t limit = 200) {
     return msg;
   }
   return msg.substr(0, limit) + "...";
+}
+
+bool startsWith(const std::string &value, const std::string &prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
+
+void cleanupIpcSocketPath(const std::string &endpoint) {
+  if (!startsWith(endpoint, "ipc://")) {
+    return;
+  }
+  const std::string path = endpoint.substr(6);
+  if (!path.empty()) {
+    std::remove(path.c_str());
+  }
 }
 } // namespace
 
@@ -38,31 +53,37 @@ AApplication::~AApplication() {
 void AApplication::setupBroker(const std::string& baseEndpoint, bool isServer) {
     _isServerMode = isServer;
 
-    if (baseEndpoint.find(":*") != std::string::npos) {
-        // Wildcard mode (likely client with ephemeral ports)
-        // We can't calculate port+1, so we just use wildcard for both.
-        // ZeroMQ will assign two different random ports.
-        _pubBrokerEndpoint = baseEndpoint;
-        _subBrokerEndpoint = baseEndpoint; // Will bind to a new random port
+  // IPC mode: use a namespace and derive dedicated pub/sub socket paths.
+  // Example: ipc:///tmp/rtype-client-bus-1234 ->
+  //          ipc:///tmp/rtype-client-bus-1234-pub / ...-sub
+  if (baseEndpoint.find("ipc://") == 0) {
+    _pubBrokerEndpoint = baseEndpoint + "-pub";
+    _subBrokerEndpoint = baseEndpoint + "-sub";
+  } else if (baseEndpoint.find(":*") != std::string::npos) {
+    // Wildcard mode (likely client with ephemeral ports)
+    // We can't calculate port+1, so we just use wildcard for both.
+    // ZeroMQ will assign two different random ports.
+    _pubBrokerEndpoint = baseEndpoint;
+    _subBrokerEndpoint = baseEndpoint; // Will bind to a new random port
+  } else {
+    size_t colonPos = baseEndpoint.find_last_of(':');
+    if (colonPos != std::string::npos) {
+      std::string base = baseEndpoint.substr(0, colonPos);
+      int port = 0;
+      try {
+        port = std::stoi(baseEndpoint.substr(colonPos + 1));
+      } catch (const std::exception &e) {
+        // If it's not a number (and not * which we caught above), log error
+        std::cerr << "Invalid port in baseEndpoint: " << e.what() << std::endl;
+        throw;
+      }
+      _pubBrokerEndpoint = base + ":" + std::to_string(port);
+      _subBrokerEndpoint = base + ":" + std::to_string(port + 1);
     } else {
-        size_t colonPos = baseEndpoint.find_last_of(':');
-        if (colonPos != std::string::npos) {
-            std::string base = baseEndpoint.substr(0, colonPos);
-            int port = 0;
-            try {
-                port = std::stoi(baseEndpoint.substr(colonPos + 1));
-            } catch (const std::exception& e) {
-                // If it's not a number (and not * which we caught above), log error
-                std::cerr << "Invalid port in baseEndpoint: " << e.what() << std::endl;
-                throw;
-            }
-            _pubBrokerEndpoint = base + ":" + std::to_string(port);
-            _subBrokerEndpoint = base + ":" + std::to_string(port + 1);
-        } else {
-            _pubBrokerEndpoint = baseEndpoint;
-            _subBrokerEndpoint = baseEndpoint;
-        }
+      _pubBrokerEndpoint = baseEndpoint;
+      _subBrokerEndpoint = baseEndpoint;
     }
+  }
 
 
     if (_pubBrokerEndpoint.find("tcp://") != 0 && _pubBrokerEndpoint.find("ipc://") != 0 && _pubBrokerEndpoint.find("inproc://") != 0) {
@@ -78,6 +99,10 @@ void AApplication::setupBroker(const std::string& baseEndpoint, bool isServer) {
             _xsubSocket = std::make_unique<zmq::socket_t>(_zmqContext, zmq::socket_type::xsub);
             _publisher = std::make_unique<zmq::socket_t>(_zmqContext, zmq::socket_type::pub);
             _subscriber = std::make_unique<zmq::socket_t>(_zmqContext, zmq::socket_type::sub);
+
+        // Prevent stale IPC socket files from previous crashes from blocking bind().
+        cleanupIpcSocketPath(_pubBrokerEndpoint);
+        cleanupIpcSocketPath(_subBrokerEndpoint);
 
             _xpubSocket->bind(_pubBrokerEndpoint);
             // If we bound to a wildcard port, update the endpoint with the actual assigned port
