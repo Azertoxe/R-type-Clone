@@ -109,6 +109,8 @@ private:
   void handleSendRequest(const std::string &payload);
   void handleSendToRequest(const std::string &payload);
   void handleBroadcastRequest(const std::string &payload);
+  void handleSetLagRequest(const std::string &payload);
+  void handleSetBandwidthLoggingRequest(const std::string &payload);
   
   // Binary handlers
   void handleSendBinaryRequest(const std::string &payload);
@@ -132,15 +134,22 @@ private:
   void sendHeartbeats();
   void markClientDisconnected(uint32_t clientId, const std::string &reason);
   void sendToEndpoint(const udp::endpoint &endpoint, const std::string &topic,
-                      const std::string &payload);
+            const std::string &payload,
+            uint64_t messageId = 0);
   void sendToEndpointBinary(const udp::endpoint &endpoint,
                             const std::string &topic,
-                            const std::vector<char> &payload);
+              const std::vector<char> &payload,
+              uint64_t messageId = 0);
   bool isReliableTopic(const std::string &topic) const;
   void trackReliableMessage(uint32_t clientId, const std::string &topic,
-                            const std::string &payload);
+              const std::string &payload, uint64_t messageId);
   void handleAckMessage(uint32_t clientId, const std::string &payload);
   void processReliableResends();
+    uint64_t nextReliableMessageId();
+    uint64_t nowSinceStartMs() const;
+    void logPacket(const char *direction, const std::string &topic,
+           std::size_t sizeBytes);
+    void reportBandwidthUsage();
 
   asio::io_context _ioContext;
   std::unique_ptr<WorkGuard> _workGuard;
@@ -180,6 +189,7 @@ private:
 
   struct ReliablePacket {
     uint32_t clientId = 0;
+    uint64_t messageId = 0;
     std::string topic;
     std::string payload;
     std::chrono::steady_clock::time_point lastSent;
@@ -188,8 +198,16 @@ private:
   std::mutex _reliableMutex;
   std::unordered_map<std::string, ReliablePacket> _pendingReliablePackets;
   std::chrono::steady_clock::time_point _lastReliableCheckTime;
-  static constexpr auto RELIABLE_RESEND_INTERVAL = std::chrono::milliseconds(500);
+  static constexpr auto RELIABLE_RESEND_INTERVAL = std::chrono::milliseconds(200);
   static constexpr int RELIABLE_MAX_ATTEMPTS = 6;
+  std::atomic<uint64_t> _nextReliableMessageId{1};
+
+  std::atomic<int> _simulatedLagMs{0};
+  std::atomic<bool> _bandwidthLoggingEnabled{false};
+  std::atomic<uint64_t> _sentBytesThisSecond{0};
+  std::atomic<uint64_t> _receivedBytesThisSecond{0};
+  std::chrono::steady_clock::time_point _startTime;
+  std::chrono::steady_clock::time_point _lastBandwidthReportTime;
 
   LobbyManager _lobbyManager;
 

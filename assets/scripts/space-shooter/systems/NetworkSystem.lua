@@ -1,6 +1,6 @@
 local Spawns = dofile("assets/scripts/space-shooter/spawns.lua")
 local config = dofile("assets/scripts/space-shooter/config.lua")
-local ScoreSystem = dofile("assets/scripts/space-shooter/systems/ScoreSystem.lua")
+local ScoreSystem = _G.ScoreSystem or require("assets/scripts/space-shooter/systems/ScoreSystem")
 
 -- Expose globally so other systems (MenuSystem) can read connection state.
 local NetworkSystem = {}
@@ -69,10 +69,47 @@ local function buildStateData(id, transform, phys, typeNum)
     }
 end
 
+local function getScaleForType(typeNum)
+    if typeNum == 1 then
+        return config.player.scale, config.player.scale, config.player.scale
+    end
+    if typeNum == 2 or typeNum == 3 then
+        return 0.2, 0.2, 0.2
+    end
+    if typeNum == 99 then
+        return 6.2, 6.2, 6.2
+    end
+    return config.enemy.scale, config.enemy.scale, config.enemy.scale
+end
+
 local function countTableKeys(tbl)
     local c = 0
     for _ in pairs(tbl) do c = c + 1 end
     return c
+end
+
+local function resolveCurrentLevel()
+    if _G.CurrentLevel then
+        return tonumber(_G.CurrentLevel) or 1
+    end
+
+    local file = io.open("current_level.txt", "r")
+    if file then
+        local content = file:read("*all")
+        file:close()
+        return tonumber(content) or 1
+    end
+
+    return 1
+end
+
+local function resetLevelToOne()
+    _G.CurrentLevel = 1
+    local file = io.open("current_level.txt", "w")
+    if file then
+        file:write("1")
+        file:close()
+    end
 end
 
 function NetworkSystem.resetWorldState()
@@ -193,6 +230,7 @@ function NetworkSystem.init()
             if #gameStateEntities > 0 then
                 local gameState = ECS.getComponent(gameStateEntities[1], "GameState")
                 if gameState.state ~= "PLAYING" then
+                    resetLevelToOne()
                     ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
                     gameState.lastScore = 0
                 end
@@ -253,6 +291,7 @@ function NetworkSystem.init()
                 print("[NetworkSystem] Current GameState: " .. gameState.state)
                 if gameState.state == "MENU" then
                     print("  -> Starting game upon client request")
+                    resetLevelToOne()
                     ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
                     gameState.lastScore = 0
                 end
@@ -404,18 +443,53 @@ function NetworkSystem.init()
             if not NetworkSystem.myServerId then
                 ECS.sendNetworkMessage("REQUEST_SPAWN", "1")
             end
+
+            -- Fallback: ensure level visuals/background exist even if initial LEVEL_CHANGE was missed.
+            local bgEntities = ECS.getEntitiesWith({"Background"})
+            if #bgEntities == 0 then
+                local levelNum = resolveCurrentLevel()
+                dofile("assets/scripts/space-shooter/levels/Level-" .. levelNum .. ".lua")
+                ECS.sendMessage("ShowLevelIntro", tostring(levelNum))
+                ScoreSystem.adjustToScreenSize(_G.SCREEN_WIDTH, _G.SCREEN_HEIGHT)
+            end
         end)
 
         ECS.subscribe("GAME_SCORE", function(msg)
             local scoreVal = tonumber(msg)
             if scoreVal then
+                CurrentScore = scoreVal
                 -- Find local score entity and update it
                 local scoreEntities = ECS.getEntitiesWith({"Score"})
                 if #scoreEntities > 0 then
                     local scoreComp = ECS.getComponent(scoreEntities[1], "Score")
                     scoreComp.value = scoreVal
+                    ECS.addComponent(scoreEntities[1], "Score", scoreComp)
+                else
+                    local scoreEntity = ECS.createEntity()
+                    ECS.addComponent(scoreEntity, "Score", Score(scoreVal))
                 end
             end
+        end)
+
+        ECS.subscribe("PLAYER_HP", function(msg)
+            local id, hpStr, maxStr = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)")
+            if not id then return end
+            if id ~= tostring(NetworkSystem.myServerId) then return end
+
+            local hp = tonumber(hpStr)
+            local maxHp = tonumber(maxStr)
+            if not hp or not maxHp then return end
+
+            local localId = NetworkSystem.serverEntities[id]
+            if not localId then return end
+
+            local life = ECS.getComponent(localId, "Life")
+            if not life then
+                life = Life(maxHp)
+            end
+            life.amount = hp
+            life.max = maxHp
+            ECS.addComponent(localId, "Life", life)
         end)
 
         ECS.subscribe("ENTITY_HIT", function(msg)
@@ -567,9 +641,11 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
 
              local t = ECS.getComponent(localId, "Transform")
                 if t then
-                    t.sx = config.player.scale
-                    t.sy = config.player.scale
-                    t.sz = config.player.scale
+                    t.sx, t.sy, t.sz = getScaleForType(1)
+                    -- Keep player visually stable; server-authoritative gameplay does not need ship spin.
+                    t.rx = 0
+                    t.ry = 0
+                    t.rz = 0
                 end
              -- Reactor Particles (Blue Trail) for ALL players (Local and Remote)
              ECS.addComponent(localId, "ParticleGenerator", ParticleGenerator(
@@ -589,6 +665,7 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
                  ECS.addComponent(localId, "Player", Player(config.player.speed))
                  ECS.addComponent(localId, "Weapon", Weapon(config.player.weaponCooldown))
                  ECS.addComponent(localId, "Physic", Physic(1.0, 0.0, false, false))
+                 ECS.addComponent(localId, "Life", Life(100))
                  -- We do NOT add Collider yet, to avoid local collision resolution conflicts.
                  -- We trust the server for collisions.
              end
@@ -608,7 +685,7 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
             ECS.addComponent(localId, "Color", Color(0.9, 0.1, 0.1))
             ECS.addComponent(localId, "Animation", Animation(8, 0.15, true, "assets/models/Monster_3/motion_"))
             local t = ECS.getComponent(localId, "Transform")
-            t.sx = 2.3; t.sy = 2.3; t.sz = 2.3
+            t.sx, t.sy, t.sz = getScaleForType(99)
         elseif nType >= 4 then
             local configIndex = nType - 3
             local enemyConfigs = {
@@ -631,18 +708,15 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
         if t then
             -- Always drive client-side positions from server, including for my own player (no prediction now).
             t.targetX, t.targetY, t.targetZ = nx, ny, nz
-            t.targetRX, t.targetRY, t.targetRZ = nrx, nry, nrz
+            if nType == 1 then
+                t.targetRX, t.targetRY, t.targetRZ = 0, 0, 0
+                t.rx, t.ry, t.rz = 0, 0, 0
+            else
+                t.targetRX, t.targetRY, t.targetRZ = nrx, nry, nrz
+            end
             t.netVX, t.netVY, t.netVZ = nvx, nvy, nvz
             t.netAge = 0
-            if nType == 99 then
-                t.sx = 2.3
-                t.sy = 2.3
-                t.sz = 2.3
-            else
-                t.sx = config.enemy.scale
-                t.sy = config.enemy.scale
-                t.sz = config.enemy.scale
-            end
+            t.sx, t.sy, t.sz = getScaleForType(nType)
             if t.x == 0 and t.y == 0 and t.targetX ~= 0 then t.x, t.y, t.z = nx, ny, nz end
         end
     end
@@ -658,6 +732,7 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
              ECS.addComponent(localId, "Player", Player(config.player.speed))
              ECS.addComponent(localId, "Weapon", Weapon(config.player.weaponCooldown))
              ECS.addComponent(localId, "Physic", Physic(1.0, 0.0, true, false))
+             ECS.addComponent(localId, "Life", Life(100))
          end
     end
 end
@@ -809,6 +884,18 @@ function NetworkSystem.update(dt)
             local s = ECS.getComponent(scoreEntities[1], "Score")
             ECS.broadcastNetworkMessage("GAME_SCORE", tostring(s.value))
             NetworkSystem.debugSentScores = NetworkSystem.debugSentScores + 1
+        end
+    end
+
+    -- Broadcast each player's HP so clients can update local HUD health bar.
+    if NetworkSystem.tickCounter % 3 == 0 then
+        local playerEntities = ECS.getEntitiesWith({"Player", "Life", "NetworkIdentity"})
+        for _, id in ipairs(playerEntities) do
+            local life = ECS.getComponent(id, "Life")
+            local net = ECS.getComponent(id, "NetworkIdentity")
+            if life and net and net.uuid then
+                ECS.broadcastNetworkMessage("PLAYER_HP", tostring(net.uuid) .. " " .. tostring(life.amount or 0) .. " " .. tostring(life.max or 100))
+            end
         end
     end
 end

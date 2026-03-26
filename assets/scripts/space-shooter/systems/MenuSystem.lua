@@ -366,13 +366,15 @@ function MenuSystem.executeAction(action)
         ECS.isGameRunning = true
 
         Spawns.createPlayer(-8, 0, 0, nil)
-        local file = io.open("current_level.txt", "r")
         local level = 1
+        _G.CurrentLevel = 1
+
+        local file = io.open("current_level.txt", "w")
         if file then
-            local content = file:read("*all")
-            level = tonumber(content) or 1
+            file:write("1")
             file:close()
         end
+
         print("[MenuSystem] Loading Level " .. level .. " for solo mode")
         dofile("assets/scripts/space-shooter/levels/Level-" .. level .. ".lua")
 

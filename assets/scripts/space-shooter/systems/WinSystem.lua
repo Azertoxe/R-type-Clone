@@ -78,6 +78,8 @@ function WinSystem.init()
         _G.LevelBossDefeated = {}
     end
     _G.LevelBossActive = false
+    _G.PendingLevelAdvance = nil
+    _G.AdvancingLevel = false
 
     ECS.subscribe("BOSS_DEFEATED", function(msg)
         if not ECS.capabilities.hasAuthority then return end
@@ -85,16 +87,7 @@ function WinSystem.init()
         local defeatedLevel = tonumber(msg) or (_G.CurrentLevel or 1)
         _G.LevelBossDefeated[defeatedLevel] = true
         _G.LevelBossActive = false
-
-        -- Progress to next level (or complete game if final level).
-        local scoreEntities = ECS.getEntitiesWith({"Score"})
-        local scoreValue = 0
-        if #scoreEntities > 0 then
-            local scoreComp = ECS.getComponent(scoreEntities[1], "Score")
-            scoreValue = scoreComp and scoreComp.value or 0
-        end
-
-        advanceToLevel(defeatedLevel + 1, scoreValue)
+        _G.PendingLevelAdvance = defeatedLevel
     end)
 end
 
@@ -103,6 +96,23 @@ function WinSystem.update(dt)
     if not ECS.isGameRunning then return end
 
     local currentLevel = _G.CurrentLevel or 1
+
+    if _G.PendingLevelAdvance == currentLevel and not _G.AdvancingLevel then
+        _G.AdvancingLevel = true
+
+        local scoreEntities = ECS.getEntitiesWith({"Score"})
+        local scoreValue = 0
+        if #scoreEntities > 0 then
+            local scoreComp = ECS.getComponent(scoreEntities[1], "Score")
+            scoreValue = scoreComp and scoreComp.value or 0
+        end
+
+        advanceToLevel(currentLevel + 1, scoreValue)
+        _G.PendingLevelAdvance = nil
+        _G.AdvancingLevel = false
+        return
+    end
+
     local scoreEntities = ECS.getEntitiesWith({"Score"})
     if #scoreEntities == 0 then return end
 

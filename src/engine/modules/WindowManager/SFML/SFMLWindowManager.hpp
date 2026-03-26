@@ -29,6 +29,7 @@
 #pragma once
 
 #include <SFML/Graphics.hpp>
+#include <array>
 #include <memory>
 #include "../IWindowManager.hpp"
 
@@ -61,5 +62,7 @@ class SFMLWindowManager : public IWindowManager {
     std::string _windowTitle = "R-Type Clone";
     Vector2u _windowedSize = {800, 600};
     bool _isFullscreen = false;
+    bool _isFocused = true;
+    std::array<bool, sf::Keyboard::KeyCount> _pressedKeys{};
 };
 }  // namespace rtypeEngine

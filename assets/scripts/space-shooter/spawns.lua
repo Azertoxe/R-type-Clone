@@ -84,16 +84,16 @@ function Spawns.createExplosion(x, y, z)
         0, 0, 0,      -- Offset
         0, 1, 0,      -- Direction (Omni-ish due to spread)
         360.0,        -- Spread (Full sphere)
-        5.0,          -- Speed
-        0.5,          -- LifeTime
-        200.0,        -- Rate (Burst)
-        0.2,          -- Size
+        3.5,          -- Speed
+        0.3,          -- LifeTime
+        80.0,         -- Rate (Burst)
+        0.14,         -- Size
         1.0, 0.5, 0.0 -- Color (Orange)
     ))
     
-    -- Self-destruct after 0.5s using LifeSystem logic
+    -- Self-destruct shortly after burst emission.
     local life = Life(0)
-    life.invulnerableTime = 0.5
+    life.invulnerableTime = 0.35
     ECS.addComponent(e, "Life", life)
     
     return e
@@ -348,7 +348,6 @@ function Spawns.createCoreEntities(level, backgroundTexture)
         Spawns.createBackground(bgTex, 80, 60)
     else
         Spawns.createBackground(bgTex)
-        Spawns.createScore(CurrentScore)
     end
 
 

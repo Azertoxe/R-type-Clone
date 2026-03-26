@@ -134,6 +134,7 @@ function BossSystem.update(dt)
                 _G.LevelBossDefeated = {}
             end
             _G.LevelBossDefeated[defeatedLevel] = true
+            _G.PendingLevelAdvance = defeatedLevel
 
             ECS.sendMessage("BOSS_DEFEATED", tostring(defeatedLevel))
             if ECS.capabilities.hasNetworkSync then

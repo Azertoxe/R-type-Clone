@@ -15,7 +15,8 @@ end
 
 local function transformChanged(cache, t)
     return not (nearlyEqual(cache.x, t.x) and nearlyEqual(cache.y, t.y) and nearlyEqual(cache.z, t.z)
-        and nearlyEqual(cache.rx, t.rx) and nearlyEqual(cache.ry, t.ry) and nearlyEqual(cache.rz, t.rz))
+    and nearlyEqual(cache.rx, t.rx) and nearlyEqual(cache.ry, t.ry) and nearlyEqual(cache.rz, t.rz)
+    and nearlyEqual(cache.sx, t.sx) and nearlyEqual(cache.sy, t.sy) and nearlyEqual(cache.sz, t.sz))
 end
 
 local function colorChanged(cache, c)
@@ -73,6 +74,7 @@ function RenderSystem.update(dt)
                 texture = nil,
                 x = nil, y = nil, z = nil,
                 rx = nil, ry = nil, rz = nil,
+                sx = nil, sy = nil, sz = nil,
                 cr = nil, cg = nil, cb = nil,
             }
         end
@@ -84,6 +86,7 @@ function RenderSystem.update(dt)
              ECS.sendMessage("RenderEntityCommand", "CreateEntity:" .. type .. ":" .. id)
              ECS.sendMessage("RenderEntityCommand", "SetScale:" .. id .. "," .. transform.sx .. "," .. transform.sy .. "," .. transform.sz)
              cached.model = mesh.modelPath
+               cached.sx, cached.sy, cached.sz = transform.sx, transform.sy, transform.sz
              
              -- Force texture update after model change
              cached.texture = nil 
@@ -103,10 +106,14 @@ function RenderSystem.update(dt)
         end
 
         if transformChanged(cached, transform) then
+            if not (nearlyEqual(cached.sx, transform.sx) and nearlyEqual(cached.sy, transform.sy) and nearlyEqual(cached.sz, transform.sz)) then
+                ECS.sendMessage("RenderEntityCommand", "SetScale:" .. id .. "," .. transform.sx .. "," .. transform.sy .. "," .. transform.sz)
+            end
             ECS.sendMessage("RenderEntityCommand", "SetPosition:" .. id .. "," .. transform.x .. "," .. transform.y .. "," .. transform.z)
             ECS.sendMessage("RenderEntityCommand", "SetRotation:" .. id .. "," .. transform.rx .. "," .. transform.ry .. "," .. transform.rz)
             cached.x, cached.y, cached.z = transform.x, transform.y, transform.z
             cached.rx, cached.ry, cached.rz = transform.rx, transform.ry, transform.rz
+            cached.sx, cached.sy, cached.sz = transform.sx, transform.sy, transform.sz
         end
     end
 
@@ -123,6 +130,7 @@ function RenderSystem.update(dt)
             RenderSystem.initializedEntities[id] = {
                 x = nil, y = nil, z = nil,
                 rx = nil, ry = nil, rz = nil,
+                sx = nil, sy = nil, sz = nil,
                 cr = nil, cg = nil, cb = nil,
             }
         end
@@ -134,10 +142,14 @@ function RenderSystem.update(dt)
         end
 
         if transformChanged(cached, transform) then
+            if not (nearlyEqual(cached.sx, transform.sx) and nearlyEqual(cached.sy, transform.sy) and nearlyEqual(cached.sz, transform.sz)) then
+                ECS.sendMessage("RenderEntityCommand", "SetScale:" .. id .. "," .. transform.sx .. "," .. transform.sy .. "," .. transform.sz)
+            end
             ECS.sendMessage("RenderEntityCommand", "SetPosition:" .. id .. "," .. transform.x .. "," .. transform.y .. "," .. transform.z)
             ECS.sendMessage("RenderEntityCommand", "SetRotation:" .. id .. "," .. transform.rx .. "," .. transform.ry .. "," .. transform.rz)
             cached.x, cached.y, cached.z = transform.x, transform.y, transform.z
             cached.rx, cached.ry, cached.rz = transform.rx, transform.ry, transform.rz
+            cached.sx, cached.sy, cached.sz = transform.sx, transform.sy, transform.sz
         end
 
         if not RenderSystem.lastText then RenderSystem.lastText = {} end

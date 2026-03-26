@@ -48,6 +48,31 @@ void SFMLWindowManager::loop() {
                 _window->close();
                 sendMessage("ExitApplication", "");
             }
+
+            if (event->is<sf::Event::FocusLost>()) {
+                _isFocused = false;
+                // Prevent sticky movement when window loses focus while key is held.
+                for (int k = 0; k < sf::Keyboard::KeyCount; ++k) {
+                    if (_pressedKeys[k]) {
+                        auto it = keyMappings.find(static_cast<sf::Keyboard::Key>(k));
+                        if (it != keyMappings.end()) {
+                            sendMessage("KeyReleased", it->second);
+                        }
+                        _pressedKeys[k] = false;
+                    }
+                }
+                continue;
+            }
+
+            if (event->is<sf::Event::FocusGained>()) {
+                _isFocused = true;
+                continue;
+            }
+
+            if (!_isFocused) {
+                continue;
+            }
+
             if (const auto* mousePressed = event->getIf<sf::Event::MouseButtonPressed>()) {
                 std::stringstream ss;
                 ss << static_cast<int>(mousePressed->button) << ":" << mousePressed->position.x << "," << mousePressed->position.y;
@@ -67,6 +92,17 @@ void SFMLWindowManager::loop() {
                 auto it = keyMappings.find(keyReleased->code);
                 if (it != keyMappings.end()) {
                     sendMessage("KeyReleased", it->second);
+                }
+                _pressedKeys[static_cast<int>(keyReleased->code)] = false;
+            }
+            if (const auto* keyPressed = event->getIf<sf::Event::KeyPressed>()) {
+                auto it = keyMappings.find(keyPressed->code);
+                if (it != keyMappings.end()) {
+                    const int keyIndex = static_cast<int>(keyPressed->code);
+                    if (!_pressedKeys[keyIndex]) {
+                        sendMessage("KeyPressed", it->second);
+                        _pressedKeys[keyIndex] = true;
+                    }
                 }
             }
             if (const auto* resized = event->getIf<sf::Event::Resized>()) {
@@ -116,13 +152,6 @@ void SFMLWindowManager::loop() {
             }
         }
     }
-
-    for (int k = 0; k < sf::Keyboard::KeyCount; ++k) {
-        auto key = static_cast<sf::Keyboard::Key>(k);
-        if (sf::Keyboard::isKeyPressed(key)) {
-            sendMessage("KeyPressed", keyMappings.at(key));
-        }
-    }
 }
 
 void SFMLWindowManager::cleanup() {
@@ -134,6 +163,7 @@ void SFMLWindowManager::cleanup() {
 void SFMLWindowManager::createWindow(const std::string &title, const Vector2u &size) {
     _window = std::make_unique<sf::RenderWindow>(
         sf::VideoMode(sf::Vector2u(size.x, size.y)), title);
+    _window->setKeyRepeatEnabled(false);
     _texture = sf::Texture(sf::Vector2u(size.x, size.y));
     _sprite = sf::Sprite(_texture);
 }
@@ -291,6 +321,7 @@ void SFMLWindowManager::recreateWindow(bool fullscreen) {
         auto desktopMode = sf::VideoMode::getDesktopMode();
         _window = std::make_unique<sf::RenderWindow>(
             desktopMode, _windowTitle, sf::State::Fullscreen);
+        _window->setKeyRepeatEnabled(false);
 
         sf::Vector2u size = _window->getSize();
 
@@ -313,6 +344,7 @@ void SFMLWindowManager::recreateWindow(bool fullscreen) {
         // Windowed mode
         _window = std::make_unique<sf::RenderWindow>(
             sf::VideoMode(sf::Vector2u(_windowedSize.x, _windowedSize.y)), _windowTitle, sf::Style::Default);
+        _window->setKeyRepeatEnabled(false);
 
         // Create texture and sprite with correct size
         _texture = sf::Texture(sf::Vector2u(_windowedSize.x, _windowedSize.y));
