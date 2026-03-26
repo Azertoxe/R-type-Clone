@@ -38,6 +38,14 @@ void LuaECSManager::setupLuaBindings() {
           _capabilities["isLocalMode"] = false;
           _capabilities["isClientMode"] = true;
           _capabilities["isServer"] = false;
+          } else if (mode_name == "CLIENT") {
+            _capabilities["hasAuthority"] = false;
+            _capabilities["hasRendering"] = true;
+            _capabilities["hasLocalInput"] = true;
+            _capabilities["hasNetworkSync"] = true;
+            _capabilities["isLocalMode"] = false;
+            _capabilities["isClientMode"] = true;
+            _capabilities["isServer"] = false;
       } else if (mode_name == "MULTI_SERVER") {
           _capabilities["hasAuthority"] = true;
           _capabilities["hasRendering"] = false;
@@ -46,6 +54,14 @@ void LuaECSManager::setupLuaBindings() {
           _capabilities["isLocalMode"] = false;
           _capabilities["isClientMode"] = false;
           _capabilities["isServer"] = true;
+          } else if (mode_name == "HOST") {
+            _capabilities["hasAuthority"] = true;
+            _capabilities["hasRendering"] = true;
+            _capabilities["hasLocalInput"] = true;
+            _capabilities["hasNetworkSync"] = true;
+            _capabilities["isLocalMode"] = false;
+            _capabilities["isClientMode"] = false;
+            _capabilities["isServer"] = true;
       } else {
           _capabilities["hasAuthority"] = false;
           _capabilities["hasRendering"] = false;
