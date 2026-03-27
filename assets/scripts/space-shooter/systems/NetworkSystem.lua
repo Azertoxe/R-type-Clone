@@ -424,6 +424,37 @@ function NetworkSystem.init()
             NetworkSystem.readyClients = {}
         end)
 
+        -- LEVEL_CHANGE - Revive dead players and restore HP
+        ECS.subscribe("LEVEL_CHANGE", function(level)
+            print("[NetworkSystem] LEVEL_CHANGE to level " .. tostring(level) .. " - Reviving all players")
+
+            -- Tell C++ to revive dead players in GameStateMachine
+            ECS.sendMessage("RequestRevivePlayers", "")
+
+            -- Respawn any dead players (those without entities)
+            for clientId in pairs(NetworkSystem.joinedClients) do
+                if not NetworkSystem.clientEntities[clientId] then
+                    -- Player was dead, respawn them
+                    NetworkSystem.spawnPlayerForClient(clientId)
+                    print("[NetworkSystem] Respawned dead player " .. clientId)
+                else
+                    -- Player alive, restore HP to full
+                    local entityId = NetworkSystem.clientEntities[clientId]
+                    local life = ECS.getComponent(entityId, "Life")
+                    if life then
+                        life.amount = life.max or 100
+                        ECS.addComponent(entityId, "Life", life)
+                        -- Broadcast HP update
+                        local net = ECS.getComponent(entityId, "NetworkIdentity")
+                        if net and net.uuid then
+                            ECS.broadcastNetworkMessage("PLAYER_HP", tostring(net.uuid) .. " " .. tostring(life.amount) .. " " .. tostring(life.max))
+                        end
+                        print("[NetworkSystem] Restored HP for player " .. clientId)
+                    end
+                end
+            end
+        end)
+
         -- Player left game
         ECS.subscribe("PLAYER_LEAVE", function(msg)
             local clientId = tonumber(string.match(msg, "^(%d+)"))

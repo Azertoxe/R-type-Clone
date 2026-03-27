@@ -248,6 +248,12 @@ void NetworkManager::registerSubscriptions() {
       _gameStateMachine.resetToLobby();
     }
   });
+
+  subscribe("RequestRevivePlayers", [this](const std::string &) {
+    if (_isServer) {
+      _gameStateMachine.reviveAllPlayers();
+    }
+  });
 }
 
 void NetworkManager::handleCommandString(const std::string &commandLine) {

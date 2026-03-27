@@ -435,6 +435,28 @@ void GameStateMachine::resetToLobby() {
   std::cout << "[GameStateMachine] Reset to LOBBY" << std::endl;
 }
 
+void GameStateMachine::reviveAllPlayers() {
+  std::lock_guard<std::mutex> lock(_mutex);
+
+  // Only revive during IN_GAME state
+  if (_gameState != GameState::IN_GAME) {
+    return;
+  }
+
+  auto now = std::chrono::steady_clock::now();
+  for (auto &[id, session] : _players) {
+    if (session.state == PlayerState::DEAD) {
+      session.state = PlayerState::IN_GAME;
+      session.lastHeartbeat = now;
+      std::cout << "[GameStateMachine] Player " << id << " revived for new level" << std::endl;
+
+      if (_onPlayerStateChange) {
+        _onPlayerStateChange(id, PlayerState::DEAD, PlayerState::IN_GAME);
+      }
+    }
+  }
+}
+
 void GameStateMachine::setStateChangeCallback(StateChangeCallback cb) {
   std::lock_guard<std::mutex> lock(_mutex);
   _onStateChange = std::move(cb);

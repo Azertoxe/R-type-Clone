@@ -85,6 +85,7 @@ public:
   bool shouldTransitionToEnding() const;
   void forceEndGame();
   void resetToLobby();
+  void reviveAllPlayers(); // Revive dead players for new level
 
   // Callbacks
   void setStateChangeCallback(StateChangeCallback cb);
