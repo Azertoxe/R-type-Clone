@@ -134,8 +134,6 @@ elseif CollisionSystem.hasTag(id2, "Player") and CollisionSystem.hasTag(id1, "Bo
 end
 
 function CollisionSystem.handlePlayerEnemy(playerId, enemyId)
-    print("DEBUG: Collision Player " .. playerId .. " vs Enemy " .. enemyId)
-
     -- ⚠️ AUTHORITY: Only server/solo modifies life (guaranteed by update() check)
     local life = ECS.getComponent(playerId, "Life")
     local color = ECS.getComponent(playerId, "Color")
@@ -203,7 +201,6 @@ function CollisionSystem.handleEnemyBullet(enemyId, bulletId)
         local playerScore = ECS.getComponent(ownerComp.id, "Score")
         if playerScore then
             playerScore.value = playerScore.value + config.score.kill
-            print("[DEBUG] Player " .. ownerComp.id .. " score: " .. playerScore.value)
         end
     end
 
@@ -212,7 +209,6 @@ function CollisionSystem.handleEnemyBullet(enemyId, bulletId)
     if #scoreEntities > 0 then
         local scoreComp = ECS.getComponent(scoreEntities[1], "Score")
         scoreComp.value = scoreComp.value + config.score.kill
-        print("[DEBUG] Global score: " .. scoreComp.value)
     end
 
     -- Destroy bullet after hit
@@ -232,7 +228,29 @@ function CollisionSystem.handlePlayerBonus(playerId, bonusId)
         if PowerUpSystem and PowerUpSystem.applyPowerUp then
             PowerUpSystem.applyPowerUp(playerId, pType, duration)
         else
-            ECS.addComponent(playerId, "PowerUp", { timeRemaining = duration, originalCooldown = 0.2, powerType = pType })
+            -- Safety path: still apply a real weapon buff if PowerUpSystem isn't in scope.
+            local weapon = ECS.getComponent(playerId, "Weapon")
+            local profile = ECS.getComponent(playerId, "WeaponProfile")
+            if weapon then
+                if not profile then
+                    profile = WeaponProfile("STANDARD", weapon.cooldown or 0.2)
+                end
+
+                if pType == "RAPID" then
+                    weapon.cooldown = 0.1
+                    profile.weaponType = "STANDARD"
+                elseif pType == "SPREAD" then
+                    weapon.cooldown = 0.22
+                    profile.weaponType = "SPREAD"
+                elseif pType == "BURST" then
+                    weapon.cooldown = 0.28
+                    profile.weaponType = "BURST"
+                end
+
+                ECS.addComponent(playerId, "Weapon", weapon)
+                ECS.addComponent(playerId, "WeaponProfile", profile)
+            end
+            ECS.addComponent(playerId, "PowerUp", { timeRemaining = duration, originalCooldown = (profile and profile.baseCooldown) or 0.2, powerType = pType })
         end
         
         -- Play powerup sound

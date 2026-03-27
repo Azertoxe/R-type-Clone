@@ -183,7 +183,7 @@ end
 -- ============================================================================
 -- BULLET
 -- ============================================================================
-function Spawns.spawnBullet(x, y, z, isEnemy, ownerId)
+function Spawns.spawnBullet(x, y, z, isEnemy, ownerId, customVx, customVy)
     local e = ECS.createEntity()
     
     local speed = isEnemy and -config.bullet.speed or config.bullet.speed
@@ -201,7 +201,8 @@ function Spawns.spawnBullet(x, y, z, isEnemy, ownerId)
 
     -- Physics
     local phys = Physic(0.1, 0.0, true, false)
-    phys.vx = speed
+    phys.vx = customVx or speed
+    phys.vy = customVy or 0
     ECS.addComponent(e, "Physic", phys)
     ECS.addComponent(e, "Collider", Collider(config.bullet.collider.type, config.bullet.collider.size))
 
@@ -229,6 +230,11 @@ end
 function Spawns.spawnPowerUp(x, y, z, powerType)
     local e = ECS.createEntity()
     local pickedType = powerType or "RAPID"
+    local typeToEnemyType = {
+        RAPID = 61,
+        SPREAD = 62,
+        BURST = 63
+    }
 
     ECS.addComponent(e, "Transform", Transform(x, y, z, 0, 0, 0, 0.7, 0.7, 0.7))
     ECS.addComponent(e, "Tag", Tag({"PowerUp", "Bonus"}))
@@ -236,9 +242,11 @@ function Spawns.spawnPowerUp(x, y, z, powerType)
     ECS.addComponent(e, "Physic", Physic(0.1, 0.0, true, false))
     ECS.addComponent(e, "Life", Life(1))
     ECS.addComponent(e, "Bonus", { duration = 8.0, type = pickedType })
+    ECS.addComponent(e, "EnemyType", { type = typeToEnemyType[pickedType] or 61 })
 
     local phys = ECS.getComponent(e, "Physic")
     phys.vx = -2.8
+    phys.vy = 0
 
     if hasRendering() then
         ECS.addComponent(e, "Mesh", Mesh("assets/models/cube.obj", nil))

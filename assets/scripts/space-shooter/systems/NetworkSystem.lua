@@ -20,6 +20,7 @@ NetworkSystem.debugAccum = 0
 NetworkSystem.debugSentPlayers = 0
 NetworkSystem.debugSentBullets = 0
 NetworkSystem.debugSentEnemies = 0
+NetworkSystem.debugSentPowerUps = 0
 NetworkSystem.debugSentScores = 0
 NetworkSystem.enableDebugLogs = false
 
@@ -79,6 +80,9 @@ local function getScaleForType(typeNum)
     if typeNum == 99 then
         return 6.2, 6.2, 6.2
     end
+    if typeNum == 61 or typeNum == 62 or typeNum == 63 then
+        return 0.7, 0.7, 0.7
+    end
     return config.enemy.scale, config.enemy.scale, config.enemy.scale
 end
 
@@ -86,6 +90,31 @@ local function countTableKeys(tbl)
     local c = 0
     for _ in pairs(tbl) do c = c + 1 end
     return c
+end
+
+local function applyRemoteWeaponState(serverId, weaponType, cooldown, duration)
+    local localId = NetworkSystem.serverEntities[tostring(serverId)]
+    if not localId then return end
+
+    local weapon = ECS.getComponent(localId, "Weapon") or Weapon(config.player.weaponCooldown)
+    local profile = ECS.getComponent(localId, "WeaponProfile") or WeaponProfile("STANDARD", config.player.weaponCooldown)
+
+    profile.weaponType = weaponType or "STANDARD"
+    weapon.cooldown = tonumber(cooldown) or weapon.cooldown or config.player.weaponCooldown
+
+    ECS.addComponent(localId, "Weapon", weapon)
+    ECS.addComponent(localId, "WeaponProfile", profile)
+
+    local remaining = tonumber(duration) or 0
+    if remaining > 0 then
+        ECS.addComponent(localId, "PowerUp", {
+            timeRemaining = remaining,
+            originalCooldown = profile.baseCooldown or config.player.weaponCooldown,
+            powerType = profile.weaponType
+        })
+    else
+        ECS.removeComponent(localId, "PowerUp")
+    end
 end
 
 local function resolveCurrentLevel()
@@ -492,6 +521,34 @@ function NetworkSystem.init()
             ECS.addComponent(localId, "Life", life)
         end)
 
+        ECS.subscribe("PLAYER_POWERUP", function(msg)
+            local id, pType, duration = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)")
+            if not id or not pType then return end
+
+            local cooldown = config.player.weaponCooldown
+            if pType == "RAPID" then
+                cooldown = 0.1
+            elseif pType == "SPREAD" then
+                cooldown = 0.22
+            elseif pType == "BURST" then
+                cooldown = 0.28
+            end
+
+            applyRemoteWeaponState(id, pType, cooldown, duration)
+        end)
+
+        ECS.subscribe("PLAYER_POWERUP_END", function(msg)
+            local id = string.match(msg, "([^%s]+)")
+            if not id then return end
+            applyRemoteWeaponState(id, "STANDARD", config.player.weaponCooldown, 0)
+        end)
+
+        ECS.subscribe("PLAYER_WEAPON", function(msg)
+            local id, pType, cooldown, duration = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)")
+            if not id then return end
+            applyRemoteWeaponState(id, pType, cooldown, duration)
+        end)
+
         ECS.subscribe("ENTITY_HIT", function(msg)
         local id = string.match(msg, "([^%s]+)")
             if id and NetworkSystem.serverEntities[id] then
@@ -540,8 +597,6 @@ function NetworkSystem.init()
                 if id then
                     if x and y and z then
                         Spawns.createExplosion(tonumber(x), tonumber(y), tonumber(z))
-                        -- Play enemy death sound
-                        ECS.sendMessage("SoundPlay", "enemy_death_" .. id .. ":effects/explosion.wav:90")
                     end
 
                     local existing = NetworkSystem.serverEntities[id]
@@ -686,6 +741,20 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
             ECS.addComponent(localId, "Animation", Animation(8, 0.15, true, "assets/models/Monster_3/motion_"))
             local t = ECS.getComponent(localId, "Transform")
             t.sx, t.sy, t.sz = getScaleForType(99)
+        elseif nType == 61 or nType == 62 or nType == 63 then
+            ECS.addComponent(localId, "Mesh", Mesh("assets/models/cube.obj", nil))
+            ECS.addComponent(localId, "Tag", Tag({"PowerUp", "Bonus"}))
+
+            if nType == 61 then
+                ECS.addComponent(localId, "Color", Color(0.2, 0.8, 1.0))
+            elseif nType == 62 then
+                ECS.addComponent(localId, "Color", Color(1.0, 0.8, 0.0))
+            else
+                ECS.addComponent(localId, "Color", Color(1.0, 0.4, 0.2))
+            end
+
+            local t = ECS.getComponent(localId, "Transform")
+            t.sx, t.sy, t.sz = getScaleForType(nType)
         elseif nType >= 4 then
             local configIndex = nType - 3
             local enemyConfigs = {
@@ -867,13 +936,26 @@ function NetworkSystem.update(dt)
         end
     end
 
+    local powerUps = ECS.getEntitiesWith({"Bonus", "Transform"})
+    if NetworkSystem.tickCounter % 2 == 0 then -- ~every 0.16s
+        for _, id in ipairs(powerUps) do
+            local t = ECS.getComponent(id, "Transform")
+            local phys = ECS.getComponent(id, "Physic")
+            if ECS.broadcastBinary then
+                ECS.broadcastBinary("ENTITY_POS", buildStateData(id, t, phys, 61))
+            end
+            NetworkSystem.debugSentPowerUps = NetworkSystem.debugSentPowerUps + 1
+        end
+    end
+
     -- Periodic debug dump (server side) every ~1s
     if NetworkSystem.enableDebugLogs and NetworkSystem.debugAccum >= 1.0 then
-        print(string.format("[NetworkSystem][Server] tick=%d players=%d bullets=%d enemies=%d score=%d readyClients=%d", NetworkSystem.tickCounter, NetworkSystem.debugSentPlayers, NetworkSystem.debugSentBullets, NetworkSystem.debugSentEnemies, NetworkSystem.debugSentScores, countTableKeys(NetworkSystem.readyClients)))
+        print(string.format("[NetworkSystem][Server] tick=%d players=%d bullets=%d enemies=%d powerups=%d score=%d readyClients=%d", NetworkSystem.tickCounter, NetworkSystem.debugSentPlayers, NetworkSystem.debugSentBullets, NetworkSystem.debugSentEnemies, NetworkSystem.debugSentPowerUps, NetworkSystem.debugSentScores, countTableKeys(NetworkSystem.readyClients)))
         NetworkSystem.debugAccum = NetworkSystem.debugAccum - 1.0
         NetworkSystem.debugSentPlayers = 0
         NetworkSystem.debugSentBullets = 0
         NetworkSystem.debugSentEnemies = 0
+        NetworkSystem.debugSentPowerUps = 0
         NetworkSystem.debugSentScores = 0
     end
 
@@ -895,6 +977,23 @@ function NetworkSystem.update(dt)
             local net = ECS.getComponent(id, "NetworkIdentity")
             if life and net and net.uuid then
                 ECS.broadcastNetworkMessage("PLAYER_HP", tostring(net.uuid) .. " " .. tostring(life.amount or 0) .. " " .. tostring(life.max or 100))
+            end
+        end
+    end
+
+    if NetworkSystem.tickCounter % 3 == 0 then
+        local playerEntities = ECS.getEntitiesWith({"Player", "Weapon", "WeaponProfile", "NetworkIdentity"})
+        for _, id in ipairs(playerEntities) do
+            local weapon = ECS.getComponent(id, "Weapon")
+            local profile = ECS.getComponent(id, "WeaponProfile")
+            local power = ECS.getComponent(id, "PowerUp")
+            local net = ECS.getComponent(id, "NetworkIdentity")
+            if weapon and profile and net and net.uuid then
+                local remaining = power and (power.timeRemaining or 0) or 0
+                ECS.broadcastNetworkMessage(
+                    "PLAYER_WEAPON",
+                    tostring(net.uuid) .. " " .. tostring(profile.weaponType or "STANDARD") .. " " .. tostring(weapon.cooldown or config.player.weaponCooldown) .. " " .. tostring(remaining)
+                )
             end
         end
     end
