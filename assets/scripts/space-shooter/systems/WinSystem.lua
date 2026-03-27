@@ -2,6 +2,7 @@ local config = dofile("assets/scripts/space-shooter/config.lua")
 local WinSystem = {}
 
 WinSystem.levelChanged = false
+WinSystem.bossSpawnRequested = {}  -- Track which levels have requested boss spawns
 
 local function getMaxLevel()
     local thresholds = config.score.levelThresholds or {}
@@ -59,6 +60,7 @@ local function advanceToLevel(nextLevel, currentScore)
 
     -- Reset level-local boss state and enemy pacing.
     _G.LevelBossActive = false
+    WinSystem.bossSpawnRequested[nextLevel] = false  -- Clear flag for new level
     ECS.sendMessage("RESET_BOSS_STATE", "")
     if EnemySystem then
         EnemySystem.resetDifficulty()
@@ -79,7 +81,7 @@ function WinSystem.init()
     end
     _G.LevelBossActive = false
     _G.PendingLevelAdvance = nil
-    _G.AdvancingLevel = false
+    WinSystem.bossSpawnRequested = {}
 
     ECS.subscribe("BOSS_DEFEATED", function(msg)
         if not ECS.capabilities.hasAuthority then return end
@@ -87,6 +89,8 @@ function WinSystem.init()
         local defeatedLevel = tonumber(msg) or (_G.CurrentLevel or 1)
         _G.LevelBossDefeated[defeatedLevel] = true
         _G.LevelBossActive = false
+        _G.PendingLevelAdvance = defeatedLevel
+        WinSystem.bossSpawnRequested[defeatedLevel] = false  -- Reset for next cycle
         _G.PendingLevelAdvance = defeatedLevel
     end)
 end
@@ -129,26 +133,30 @@ function WinSystem.update(dt)
 
     local threshold = getBossThresholdForLevel(currentLevel)
     if currentScore >= threshold and not _G.LevelBossActive then
-        _G.LevelBossActive = true
+        -- Only send the spawn request ONCE per level
+        if not WinSystem.bossSpawnRequested[currentLevel] then
+            _G.LevelBossActive = true
+            WinSystem.bossSpawnRequested[currentLevel] = true
 
-        local clearList = ECS.getEntitiesWith({"Enemy"})
-        for _, id in ipairs(clearList) do
-            ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(id))
-            ECS.sendMessage("PhysicCommand", "DestroyBody:" .. id .. ";")
-            ECS.destroyEntity(id)
-        end
-        clearList = ECS.getEntitiesWith({"Bullet"})
-        for _, id in ipairs(clearList) do
-            ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(id))
-            ECS.sendMessage("PhysicCommand", "DestroyBody:" .. id .. ";")
-            ECS.destroyEntity(id)
-        end
+            local clearList = ECS.getEntitiesWith({"Enemy"})
+            for _, id in ipairs(clearList) do
+                ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(id))
+                ECS.sendMessage("PhysicCommand", "DestroyBody:" .. id .. ";")
+                ECS.destroyEntity(id)
+            end
+            clearList = ECS.getEntitiesWith({"Bullet"})
+            for _, id in ipairs(clearList) do
+                ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(id))
+                ECS.sendMessage("PhysicCommand", "DestroyBody:" .. id .. ";")
+                ECS.destroyEntity(id)
+            end
 
-        ECS.sendMessage("BOSS_SPAWN_REQUEST", tostring(currentLevel))
-        if ECS.capabilities.hasNetworkSync then
-            ECS.broadcastNetworkMessage("BOSS_SPAWN_REQUEST", tostring(currentLevel))
+            ECS.sendMessage("BOSS_SPAWN_REQUEST", tostring(currentLevel))
+            if ECS.capabilities.hasNetworkSync then
+                ECS.broadcastNetworkMessage("BOSS_SPAWN_REQUEST", tostring(currentLevel))
+            end
+            print("[WinSystem] Boss spawn threshold reached for level " .. tostring(currentLevel))
         end
-        print("[WinSystem] Boss gate triggered for level " .. tostring(currentLevel))
     end
 end
 

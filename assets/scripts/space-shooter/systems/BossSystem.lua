@@ -4,6 +4,7 @@ local BossSystem = {
     spawned = false,
     defeated = false,
     currentBossLevel = nil,
+    spawnInProgress = false,  -- Prevent multiple concurrent spawn attempts
 }
 
 local function hasBossEntity()
@@ -15,6 +16,7 @@ local function resetState()
     BossSystem.spawned = false
     BossSystem.defeated = false
     BossSystem.currentBossLevel = nil
+    BossSystem.spawnInProgress = false
 end
 
 local function configureBossForLevel(bossId, level)
@@ -53,17 +55,26 @@ local function configureBossForLevel(bossId, level)
 end
 
 local function spawnBossForLevel(level)
-    local hasBoss = hasBossEntity()
-    if hasBoss then
+    -- Prevent multiple spawn attempts in progress
+    if BossSystem.spawnInProgress or BossSystem.spawned then
         return
     end
 
+    local hasBoss = hasBossEntity()
+    if hasBoss then
+        BossSystem.spawned = true
+        BossSystem.currentBossLevel = level
+        return
+    end
+
+    BossSystem.spawnInProgress = true
     local bossId = Spawns.spawnBoss(16, 0, 0)
     configureBossForLevel(bossId, level)
 
     BossSystem.spawned = true
     BossSystem.defeated = false
     BossSystem.currentBossLevel = level
+    BossSystem.spawnInProgress = false
 
     print("[BossSystem] Spawned giant boss for level " .. tostring(level))
 end

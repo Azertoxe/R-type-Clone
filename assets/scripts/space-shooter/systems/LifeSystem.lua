@@ -30,7 +30,7 @@ function LifeSystem.update(dt)
         local hasAuthority = ECS.hasComponent(id, "ServerAuthority")
 
         -- Boundary Check (Optimization): Destroy entities that go too far off-screen (only on authority)
-        if hasAuthority and t.x < -50 or t.x > 50 or t.y < -30 or t.y > 30 then
+        if hasAuthority and (t.x < -50 or t.x > 50 or t.y < -30 or t.y > 30) then
             life.amount = 0
         end
 
@@ -108,10 +108,20 @@ function LifeSystem.update(dt)
                         ECS.broadcastNetworkMessage("PLAY_SOUND", "gameover:effects/gameover.wav:100")
                     end
 
-                    local netId = ECS.getComponent(id, "NetworkId")
-                    if netId then
-                        ECS.sendToClient(tonumber(netId.id), "GAME_OVER", tostring(finalScore))
-                        ECS.sendMessage("SERVER_PLAYER_DEAD", tostring(netId.id))
+                    local ownerClientId = nil
+                    local netIdentity = ECS.getComponent(id, "NetworkIdentity")
+                    if netIdentity and netIdentity.ownerId and tonumber(netIdentity.ownerId) then
+                        ownerClientId = tonumber(netIdentity.ownerId)
+                    else
+                        local legacyNetId = ECS.getComponent(id, "NetworkId")
+                        if legacyNetId and legacyNetId.id and tonumber(legacyNetId.id) then
+                            ownerClientId = tonumber(legacyNetId.id)
+                        end
+                    end
+
+                    if ownerClientId and ownerClientId > 0 then
+                        ECS.sendToClient(ownerClientId, "GAME_OVER", tostring(finalScore))
+                        ECS.sendMessage("SERVER_PLAYER_DEAD", tostring(ownerClientId))
                     end
                 end
                 end  -- Close the if hasAuthority

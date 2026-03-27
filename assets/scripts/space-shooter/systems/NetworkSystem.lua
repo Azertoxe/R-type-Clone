@@ -10,6 +10,30 @@ NetworkSystem.clientEntities = {}
 NetworkSystem.serverEntities = {}
 NetworkSystem.myServerId = nil
 NetworkSystem.deathAnims = {} -- legacy, no longer used for effects
+NetworkSystem.clientDeathReported = false
+
+NetworkSystem.PLAYER_STATES = {
+    IN_LOBBY = "IN_LOBBY",
+    IN_GAME = "IN_GAME",
+    DEAD = "DEAD",
+    DISCONNECTED = "DISCONNECTED"
+}
+
+NetworkSystem.SERVER_GAME_STATES = {
+    WAITING_IN_LOBBY = "WAITING_IN_LOBBY",
+    IN_GAME = "IN_GAME"
+}
+
+NetworkSystem.LIFECYCLE_TOPICS = {
+    PLAYER_DIED = "PLAYER_DIED",
+    PLAYER_LEAVE = "PLAYER_LEAVE",
+    RETURN_TO_LOBBY = "RETURN_TO_LOBBY",
+    PLAYER_LEFT = "PLAYER_LEFT",
+    ENTITY_DESTROY = "ENTITY_DESTROY"
+}
+
+NetworkSystem.playerSessions = {}
+NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
 
 NetworkSystem.broadcastTimer = 0
 NetworkSystem.broadcastInterval = 0.10
@@ -23,11 +47,114 @@ NetworkSystem.debugSentEnemies = 0
 NetworkSystem.debugSentPowerUps = 0
 NetworkSystem.debugSentScores = 0
 NetworkSystem.enableDebugLogs = false
+NetworkSystem.matchBootstrapUntil = 0
 
 local function destroyEntitySafe(id)
     if id and ECS.getComponent(id, "Transform") then
         ECS.destroyEntity(id)
     end
+end
+
+local function nowSeconds()
+    return os.clock()
+end
+
+local function isMatchBootstrapActive()
+    return nowSeconds() < (NetworkSystem.matchBootstrapUntil or 0)
+end
+
+local function ensurePlayerSession(clientId)
+    if not clientId then return nil end
+    if not NetworkSystem.playerSessions[clientId] then
+        NetworkSystem.playerSessions[clientId] = {
+            playerId = clientId,
+            entityId = nil,
+            state = NetworkSystem.PLAYER_STATES.IN_LOBBY,
+            ready = false,
+            lastPacketAt = nowSeconds()
+        }
+    end
+    return NetworkSystem.playerSessions[clientId]
+end
+
+local function setPlayerReady(clientId, isReady)
+    local session = ensurePlayerSession(clientId)
+    if not session then return end
+    local ready = (isReady == true)
+    session.ready = ready
+    if ready then
+        NetworkSystem.readyClients[clientId] = true
+    else
+        NetworkSystem.readyClients[clientId] = nil
+    end
+end
+
+local function touchPlayerSession(clientId)
+    local session = ensurePlayerSession(clientId)
+    if session then
+        session.lastPacketAt = nowSeconds()
+    end
+    return session
+end
+
+local function setPlayerState(clientId, state)
+    local session = ensurePlayerSession(clientId)
+    if not session then return end
+    session.state = state
+    session.lastPacketAt = nowSeconds()
+end
+
+local function cleanupPlayerEntity(clientId)
+    local session = ensurePlayerSession(clientId)
+    local playerId = NetworkSystem.clientEntities[clientId]
+    if not playerId and session then
+        playerId = session.entityId
+    end
+
+    if playerId then
+        ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(playerId))
+        ECS.sendMessage("PhysicCommand", "DestroyBody:" .. tostring(playerId) .. ";")
+        destroyEntitySafe(playerId)
+    end
+
+    NetworkSystem.clientEntities[clientId] = nil
+    if session then
+        session.entityId = nil
+    end
+
+    return playerId
+end
+
+local function resetLobbyReadyState(clientId)
+    setPlayerReady(clientId, false)
+    NetworkSystem.joinedClients[clientId] = true
+    if NetworkSystem.pendingClients then
+        NetworkSystem.pendingClients[clientId] = nil
+    end
+end
+
+local function notifyClientReturnToLobby(clientId, reason)
+    ECS.sendToClient(clientId, "RETURN_TO_LOBBY", tostring(reason or "returned_to_lobby"))
+    ECS.sendToClient(clientId, "CLIENT_RESET", "")
+    ECS.sendToClient(clientId, "GAME_WAITING_ROOM", tostring(reason or "returned_to_lobby"))
+end
+
+local function handlePlayerLeaveToLobby(clientId, reason)
+    cleanupPlayerEntity(clientId)
+    setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
+    resetLobbyReadyState(clientId)
+    print("[LOBBY] Player " .. tostring(clientId) .. " returned to lobby")
+    notifyClientReturnToLobby(clientId, reason)
+    ECS.broadcastNetworkMessage("PLAYER_LEFT", tostring(clientId) .. " " .. tostring(reason or "left"))
+end
+
+local function handlePlayerDeathToLobby(clientId, reason)
+    ECS.broadcastNetworkMessage("STOP_MUSIC", "bgm")
+    cleanupPlayerEntity(clientId)
+    setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
+    resetLobbyReadyState(clientId)
+    print("[LOBBY] Player " .. tostring(clientId) .. " returned to lobby")
+    notifyClientReturnToLobby(clientId, reason)
 end
 
 local function hasActiveClients()
@@ -44,6 +171,155 @@ local function hasAnyKnownClients()
     if next(NetworkSystem.joinedClients) ~= nil then return true end
     if NetworkSystem.pendingClients and next(NetworkSystem.pendingClients) ~= nil then return true end
     return false
+end
+
+local function hasActivePlayers()
+    return next(NetworkSystem.clientEntities) ~= nil
+end
+
+local function setServerToWaitingRoom(reason)
+    reason = reason or "unspecified"
+
+    NetworkSystem.resetWorldState()
+    -- Force-clear active match entity mapping before lobby setup.
+    NetworkSystem.clientEntities = {}
+    ECS.isGameRunning = false
+    NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
+    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
+
+    -- Clear readiness so lobby must explicitly ready-up again.
+    NetworkSystem.readyClients = {}
+
+    -- Ensure tracked connected sessions are considered lobby participants.
+    for clientId, session in pairs(NetworkSystem.playerSessions) do
+        if session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED then
+            session.state = NetworkSystem.PLAYER_STATES.IN_LOBBY
+            session.entityId = nil
+            session.ready = false
+            NetworkSystem.joinedClients[clientId] = true
+        end
+    end
+
+    -- Ask all connected clients to cleanup gameplay entities and show lobby.
+    ECS.broadcastNetworkMessage("CLIENT_RESET", "")
+    ECS.broadcastNetworkMessage("GAME_WAITING_ROOM", reason)
+
+    print("[LOBBY] Returned to waiting room (reason: " .. tostring(reason) .. ")")
+end
+
+local function countExpectedLobbyPlayers()
+    local count = 0
+    for clientId, session in pairs(NetworkSystem.playerSessions) do
+        if session and session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED then
+            -- Require explicit lobby presence from previous join/return.
+            if NetworkSystem.joinedClients[clientId] then
+                count = count + 1
+            end
+        end
+    end
+
+    -- Fallback for early lifecycle before sessions are fully seeded.
+    if count == 0 then
+        for _ in pairs(NetworkSystem.joinedClients) do
+            count = count + 1
+        end
+    end
+
+    return count
+end
+
+local function maybeStartGameFromLobby()
+    if NetworkSystem.serverGameState ~= NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY then
+        return
+    end
+
+    local joinedCount = countExpectedLobbyPlayers()
+
+    local readyCount = 0
+    for clientId in pairs(NetworkSystem.readyClients) do
+        local session = NetworkSystem.playerSessions[clientId]
+        if (not session or session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED) and NetworkSystem.joinedClients[clientId] then
+            readyCount = readyCount + 1
+        end
+    end
+
+    if joinedCount >= 2 and readyCount >= joinedCount then
+        print("[LOBBY] All players ready -> starting game")
+        ECS.sendMessage("GAME_START", "all_ready")
+    else
+        print("[LOBBY] Lobby readiness: " .. readyCount .. "/" .. joinedCount .. " ready")
+    end
+end
+
+local function spawnReadyLobbyPlayers(reason)
+    reason = reason or "unknown"
+    local spawned = 0
+
+    for clientId in pairs(NetworkSystem.joinedClients) do
+        local session = ensurePlayerSession(clientId)
+        if session and session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED and NetworkSystem.readyClients[clientId] then
+            if not NetworkSystem.clientEntities[clientId] then
+                NetworkSystem.spawnPlayerForClient(clientId)
+                spawned = spawned + 1
+            end
+            if NetworkSystem.pendingClients then
+                NetworkSystem.pendingClients[clientId] = nil
+            end
+        end
+    end
+
+    if hasActivePlayers() then
+        ECS.isGameRunning = true
+        local level = resolveCurrentLevel()
+        ECS.broadcastNetworkMessage("LEVEL_CHANGE", tostring(level))
+        local activeCount = 0
+        for _ in pairs(NetworkSystem.clientEntities) do
+            activeCount = activeCount + 1
+        end
+        print("[NetworkSystem] Spawned/validated lobby players for match start (" .. tostring(reason) .. "): active=" .. tostring(activeCount) .. ", spawned=" .. tostring(spawned))
+    else
+        print("[NetworkSystem] No ready lobby players available to spawn (" .. tostring(reason) .. ")")
+    end
+end
+
+local function startMatchFromLobby(reason)
+    reason = reason or "unknown"
+
+    NetworkSystem.matchBootstrapUntil = nowSeconds() + 2.5
+    NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.IN_GAME
+    ECS.isGameRunning = true
+
+    resetLevelToOne()
+    NetworkSystem.resetWorldState()
+
+    local existingClientIds = {}
+    for clientId in pairs(NetworkSystem.clientEntities) do
+        table.insert(existingClientIds, clientId)
+    end
+    for _, clientId in ipairs(existingClientIds) do
+        cleanupPlayerEntity(clientId)
+    end
+
+    spawnReadyLobbyPlayers(reason)
+    ECS.broadcastNetworkMessage("GAME_START", "all_ready")
+    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
+end
+
+local function countActivePlayerEntities()
+    local c = 0
+    for _ in pairs(NetworkSystem.clientEntities) do
+        c = c + 1
+    end
+    return c
+end
+
+local function maybeAbortMatchIfNotEnoughPlayers(reason)
+    if NetworkSystem.serverGameState ~= NetworkSystem.SERVER_GAME_STATES.IN_GAME then
+        return
+    end
+    if countActivePlayerEntities() < 2 then
+        setServerToWaitingRoom(reason or "not_enough_players")
+    end
 end
 
 local function extractVelocity(phys)
@@ -182,6 +458,8 @@ function NetworkSystem.init()
             local clientId = string.match(msg, "^(%d+)")
             if not clientId then return end
             clientId = tonumber(clientId)
+            touchPlayerSession(clientId)
+            setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
             print("Client Connected: " .. clientId)
 
             -- Check if game is already running
@@ -215,6 +493,7 @@ function NetworkSystem.init()
             local clientId = string.match(msg, "^(%d+)")
             if not clientId then return end
             clientId = tonumber(clientId)
+            touchPlayerSession(clientId)
             NetworkSystem.readyClients[clientId] = true
             ECS.isGameRunning = true
             -- Send initial score snapshot
@@ -241,28 +520,50 @@ function NetworkSystem.init()
             local clientId = string.match(msg, "^(%d+)")
             if not clientId then return end
             clientId = tonumber(clientId)
-            NetworkSystem.readyClients[clientId] = true
-            print("[NetworkSystem] Lobby ready from client " .. clientId)
+            touchPlayerSession(clientId)
+            setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
+            NetworkSystem.joinedClients[clientId] = true
+            setPlayerReady(clientId, true)
+            print("[LOBBY] Player " .. tostring(clientId) .. " ready = true")
+            maybeStartGameFromLobby()
         end)
 
         ECS.subscribe("PLAYER_JOIN", function(msg)
             local clientId = string.match(msg, "^(%d+)")
             if not clientId then return end
             clientId = tonumber(clientId)
+            touchPlayerSession(clientId)
+            setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
+            setPlayerReady(clientId, false)
             NetworkSystem.joinedClients[clientId] = true
-            print("[NetworkSystem] Lobby join from client " .. clientId)
+            print("[LOBBY] Player " .. tostring(clientId) .. " joined lobby")
+            maybeStartGameFromLobby()
+        end)
+
+        ECS.subscribe("PLAYER_LEAVE", function(msg)
+            local clientId = string.match(msg, "^(%d+)")
+            if not clientId then return end
+            clientId = tonumber(clientId)
+            touchPlayerSession(clientId)
+            handlePlayerLeaveToLobby(clientId, "player_leave")
+            print("[NetworkSystem] Client " .. clientId .. " left match via menu")
+            maybeAbortMatchIfNotEnoughPlayers("all_players_left_match")
+        end)
+
+        ECS.subscribe("PLAYER_RETURN_TO_LOBBY", function(msg)
+            local clientId = string.match(msg, "^(%d+)")
+            if not clientId then return end
+            clientId = tonumber(clientId)
+            touchPlayerSession(clientId)
+            handlePlayerLeaveToLobby(clientId, "returned_to_menu")
+            print("[NetworkSystem] Client " .. clientId .. " returned to lobby")
+            maybeAbortMatchIfNotEnoughPlayers("all_players_left_match")
         end)
 
         ECS.subscribe("GAME_START", function(msg)
             print("[NetworkSystem] GAME_START received from lobby manager")
-            local gameStateEntities = ECS.getEntitiesWith({"GameState"})
-            if #gameStateEntities > 0 then
-                local gameState = ECS.getComponent(gameStateEntities[1], "GameState")
-                if gameState.state ~= "PLAYING" then
-                    resetLevelToOne()
-                    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
-                    gameState.lastScore = 0
-                end
+            if NetworkSystem.serverGameState == NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY then
+                startMatchFromLobby("game_start")
             end
         end)
 
@@ -277,17 +578,20 @@ function NetworkSystem.init()
                     ECS.destroyEntity(pid)
                 end
                 NetworkSystem.clientEntities[cid] = nil
-                NetworkSystem.readyClients[cid] = nil
+                setPlayerReady(cid, false)
                 NetworkSystem.joinedClients[cid] = nil
             end
             NetworkSystem.pendingClients = {}
             ECS.isGameRunning = false
+            NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
             ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
         end)
 
         -- When game starts (MENU -> PLAYING), spawn pending clients
         ECS.subscribe("GAME_STARTED", function(msg)
             print("[NetworkSystem] Game started - spawning pending clients")
+            NetworkSystem.matchBootstrapUntil = nowSeconds() + 2.5
+            NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.IN_GAME
             if NetworkSystem.pendingClients then
                 for clientId, _ in pairs(NetworkSystem.pendingClients) do
                     print("  -> Spawning pending client " .. clientId)
@@ -299,17 +603,11 @@ function NetworkSystem.init()
                     end
                 end
                 NetworkSystem.pendingClients = {}
-                ECS.isGameRunning = true
-                -- Read current level from file
-                local file = io.open("current_level.txt", "r")
-                local level = 1
-                if file then
-                    local content = file:read("*all")
-                    level = tonumber(content) or 1
-                    file:close()
-                end
-                ECS.broadcastNetworkMessage("LEVEL_CHANGE", tostring(level))
             end
+
+            -- Also spawn ready lobby players in case pending list is empty
+            -- (e.g. GAME_START while state was already PLAYING).
+            spawnReadyLobbyPlayers("game_started")
         end)
 
         ECS.subscribe("REQUEST_GAME_START", function(msg)
@@ -333,6 +631,7 @@ function NetworkSystem.init()
             local clientId = string.match(msg, "^(%d+)")
             if clientId then
                 clientId = tonumber(clientId)
+                touchPlayerSession(clientId)
                 print("Spawn Request from: " .. clientId)
                 if not NetworkSystem.clientEntities[clientId] then
                     NetworkSystem.spawnPlayerForClient(clientId)
@@ -349,32 +648,35 @@ function NetworkSystem.init()
              if not clientId then return end
              clientId = tonumber(clientId)
 
-             local playerId = NetworkSystem.clientEntities[clientId]
-             if playerId then
-                 ECS.broadcastNetworkMessage("ENTITY_DESTROY", playerId)
-                 ECS.sendMessage("PhysicCommand", "DestroyBody:" .. playerId .. ";")
-                 ECS.destroyEntity(playerId)
-             end
+             touchPlayerSession(clientId)
+             cleanupPlayerEntity(clientId)
+             setPlayerState(clientId, NetworkSystem.PLAYER_STATES.DISCONNECTED)
 
-             NetworkSystem.clientEntities[clientId] = nil
-             NetworkSystem.readyClients[clientId] = nil
+             setPlayerReady(clientId, false)
              NetworkSystem.joinedClients[clientId] = nil
              if NetworkSystem.pendingClients then
                  NetworkSystem.pendingClients[clientId] = nil
              end
+             ECS.broadcastNetworkMessage("PLAYER_LEFT", tostring(clientId) .. " disconnected")
              print("Client Disconnected: " .. clientId .. " (" .. tostring(msg) .. ")")
 
              -- When the last client leaves, reset server for a clean replay/start.
              if not hasAnyKnownClients() then
                  NetworkSystem.resetWorldState()
                  ECS.isGameRunning = false
+                 NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
                  ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
                  print("[NetworkSystem] All clients left; reset to MENU")
              end
+
+             maybeAbortMatchIfNotEnoughPlayers("client_disconnected")
         end)
 
         ECS.subscribe("INPUT", function(msg)
             local clientId, payload = ECS.splitClientIdAndMessage(msg)
+            if clientId and clientId > 0 then
+                touchPlayerSession(clientId)
+            end
             local data = ECS.unpackMsgPack(payload)
 
             local key, state = nil, nil
@@ -415,12 +717,24 @@ function NetworkSystem.init()
             local clientId = string.match(msg, "^(%d+)")
             if not clientId then return end
             clientId = tonumber(clientId)
-            print("DEBUG SERVER: Player death from LifeSystem for client " .. clientId .. " - resetting world")
-            NetworkSystem.clientEntities[clientId] = nil
-            NetworkSystem.readyClients[clientId] = nil
-            ECS.sendToClient(clientId, "CLIENT_RESET", "")
-            NetworkSystem.resetWorldState()
-            ECS.isGameRunning = false
+            touchPlayerSession(clientId)
+
+            print("[NetworkSystem] Player death from LifeSystem for client " .. clientId)
+
+            handlePlayerDeathToLobby(clientId, "player_dead")
+            maybeAbortMatchIfNotEnoughPlayers("all_players_dead")
+        end)
+
+        -- Client-side explicit death report (e.g. after GAME_OVER/HP sync)
+        ECS.subscribe("PLAYER_DIED", function(msg)
+            local clientId = string.match(msg, "^(%d+)")
+            if not clientId then return end
+            clientId = tonumber(clientId)
+            touchPlayerSession(clientId)
+
+            print("[NetworkSystem] Received PLAYER_DIED from client " .. clientId)
+            handlePlayerDeathToLobby(clientId, "player_died")
+            maybeAbortMatchIfNotEnoughPlayers("all_players_dead")
         end)
 
     elseif not ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
@@ -457,10 +771,16 @@ function NetworkSystem.init()
             if id then
                 print(">> Assigned Player ID: " .. id)
                 NetworkSystem.myServerId = id
+                NetworkSystem.clientDeathReported = false
                 NetworkSystem.updateLocalEntity(id, -8, 0, 0, 0, 0, 0, 0, 0, 0, "1")
                 ECS.sendNetworkMessage("ACK", "PLAYER_ASSIGN")
-                -- Send a ready ping; network layer will prefix client id.
-                ECS.sendNetworkMessage("PLAYER_READY", "ready")
+            end
+        end)
+
+        ECS.subscribe("GAME_OVER", function(msg)
+            if not NetworkSystem.clientDeathReported then
+                NetworkSystem.clientDeathReported = true
+                ECS.sendNetworkMessage("PLAYER_DIED", "dead")
             end
         end)
 
@@ -519,6 +839,11 @@ function NetworkSystem.init()
             life.amount = hp
             life.max = maxHp
             ECS.addComponent(localId, "Life", life)
+
+            if hp <= 0 and not NetworkSystem.clientDeathReported then
+                NetworkSystem.clientDeathReported = true
+                ECS.sendNetworkMessage("PLAYER_DIED", "hp_zero")
+            end
         end)
 
         ECS.subscribe("PLAYER_POWERUP", function(msg)
@@ -611,6 +936,7 @@ function NetworkSystem.init()
             print("DEBUG CLIENT: Resetting Network State")
             NetworkSystem.myServerId = nil
             NetworkSystem.serverEntities = {}
+            NetworkSystem.clientDeathReported = false
             ECS.isGameRunning = false
             -- Cleanup any remaining rendered entities to avoid lingering cubes between modes.
             local cleanupIds = ECS.getEntitiesWith({"Transform"})
@@ -634,6 +960,18 @@ function NetworkSystem.init()
             -- Entities are destroyed by MenuSystem cleaning tags,
             -- but clearing the map prevents "ghost" updates.
         end)
+
+        ECS.subscribe("GAME_WAITING_ROOM", function(msg)
+            ECS.isGameRunning = false
+            -- Ask MenuSystem to open multiplayer lobby/waiting-room screen.
+            ECS.sendMessage("FORCE_WAITING_ROOM", tostring(msg or ""))
+        end)
+
+        ECS.subscribe("RETURN_TO_LOBBY", function(msg)
+            ECS.isGameRunning = false
+            NetworkSystem.clientDeathReported = false
+            ECS.sendMessage("FORCE_WAITING_ROOM", tostring(msg or ""))
+        end)
     end
 end
 
@@ -646,6 +984,12 @@ function NetworkSystem.spawnPlayerForClient(clientId)
     local player = Spawns.createPlayer(-8, offsetY, 0, clientId)
 
     NetworkSystem.clientEntities[clientId] = player
+    local session = touchPlayerSession(clientId)
+    if session then
+        session.entityId = player
+        session.playerId = clientId
+    end
+    setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_GAME)
     ECS.sendToClient(clientId, "PLAYER_ASSIGN", tostring(player))
 end
 
@@ -865,6 +1209,16 @@ function NetworkSystem.update(dt)
     -- ========================================================================
     if not ECS.capabilities.hasAuthority or not ECS.capabilities.hasNetworkSync then
         return
+    end
+
+    -- Safety net: if match is still marked running but no player entity remains,
+    -- force server back to waiting room even if a death/leave event was missed.
+    if ECS.isGameRunning and NetworkSystem.serverGameState == NetworkSystem.SERVER_GAME_STATES.IN_GAME and not hasActivePlayers() and not isMatchBootstrapActive() then
+        local hasPending = NetworkSystem.pendingClients and next(NetworkSystem.pendingClients) ~= nil
+        if not hasPending then
+            setServerToWaitingRoom("no_active_players_guard")
+            return
+        end
     end
 
     if not hasReadyClients() or not ECS.isGameRunning then

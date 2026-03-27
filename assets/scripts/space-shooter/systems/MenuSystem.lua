@@ -135,6 +135,7 @@ function MenuSystem.init()
     ECS.subscribe("WindowResized", MenuSystem.onWindowResized)
     ECS.subscribe("SET_GAME_MODE", MenuSystem.onSetGameMode)
     ECS.subscribe("GAME_START", MenuSystem.onGameStart)
+    ECS.subscribe("FORCE_WAITING_ROOM", MenuSystem.onForceWaitingRoom)
     ECS.subscribe("ShowLevelIntro", MenuSystem.onShowLevelIntro)
     _G.SCREEN_WIDTH = SCREEN_WIDTH
     _G.SCREEN_HEIGHT = SCREEN_HEIGHT
@@ -464,6 +465,11 @@ function MenuSystem.executeAction(action)
 
         ECS.sendMessage("MusicStop", "bgm")
 
+        if ECS.capabilities.hasNetworkSync and not ECS.capabilities.hasAuthority then
+            -- Multiplayer client: leave active match and go back to waiting room.
+            ECS.sendNetworkMessage("PLAYER_LEAVE", "menu")
+        end
+
         -- Destroy game entities
         local allEntities = ECS.getEntitiesWith({"Transform"})
         for _, id in ipairs(allEntities) do
@@ -473,7 +479,11 @@ function MenuSystem.executeAction(action)
         end
 
         MenuSystem.hideMenu()
-        MenuSystem.renderMenu()
+        if ECS.capabilities.hasNetworkSync and not ECS.capabilities.hasAuthority then
+            MenuSystem.showMultiplayerMenu()
+        else
+            MenuSystem.renderMenu()
+        end
     end
 end
 
@@ -522,6 +532,15 @@ function MenuSystem.onGameStart(_)
 
     local currentLevel = _G.CurrentLevel or 1
     MenuSystem.onShowLevelIntro(tostring(currentLevel))
+end
+
+function MenuSystem.onForceWaitingRoom(_)
+    ECS.isGameRunning = false
+    isPaused = false
+    ECS.isPaused = false
+    MenuSystem.hideMenu()
+    MenuSystem.showMultiplayerMenu()
+    print("[MenuSystem] Switched to waiting room")
 end
 
 -- ============================================================================

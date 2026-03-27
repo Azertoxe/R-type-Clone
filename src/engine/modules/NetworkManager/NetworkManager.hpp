@@ -185,7 +185,7 @@ private:
   std::chrono::steady_clock::time_point _lastHeartbeatTime;
   std::chrono::steady_clock::time_point _lastTimeoutCheckTime;
   static constexpr auto HEARTBEAT_INTERVAL = std::chrono::seconds(1);
-  static constexpr auto CLIENT_TIMEOUT = std::chrono::seconds(3);
+  static constexpr auto CLIENT_TIMEOUT = std::chrono::seconds(5);
 
   struct ReliablePacket {
     uint32_t clientId = 0;
