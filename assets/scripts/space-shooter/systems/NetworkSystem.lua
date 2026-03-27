@@ -1,325 +1,61 @@
+-- ============================================================================
+-- NetworkSystem.lua - Clean Game State System
+-- ============================================================================
+-- Server-side: Entity spawning, position broadcasting
+-- Client-side: Entity interpolation, heartbeat, state handling
+-- Game state transitions handled by C++ GameStateMachine
+-- ============================================================================
+
 local Spawns = dofile("assets/scripts/space-shooter/spawns.lua")
 local config = dofile("assets/scripts/space-shooter/config.lua")
 local ScoreSystem = _G.ScoreSystem or require("assets/scripts/space-shooter/systems/ScoreSystem")
 
--- Expose globally so other systems (MenuSystem) can read connection state.
+-- Global exposure for other systems
 local NetworkSystem = {}
 _G.NetworkSystem = NetworkSystem
 
-NetworkSystem.clientEntities = {}
-NetworkSystem.serverEntities = {}
-NetworkSystem.myServerId = nil
-NetworkSystem.deathAnims = {} -- legacy, no longer used for effects
+-- ============================================================================
+-- STATE TRACKING
+-- ============================================================================
+NetworkSystem.clientEntities = {}      -- Server: clientId -> entityId
+NetworkSystem.serverEntities = {}      -- Client: serverId -> localEntityId
+NetworkSystem.myServerId = nil         -- Client: my assigned entity ID
 NetworkSystem.clientDeathReported = false
 
-NetworkSystem.PLAYER_STATES = {
-    IN_LOBBY = "IN_LOBBY",
-    IN_GAME = "IN_GAME",
-    DEAD = "DEAD",
-    DISCONNECTED = "DISCONNECTED"
-}
-
-NetworkSystem.SERVER_GAME_STATES = {
-    WAITING_IN_LOBBY = "WAITING_IN_LOBBY",
+-- Client state (matches C++ enum)
+NetworkSystem.CLIENT_STATE = {
+    MENU = "MENU",
+    LOBBY = "LOBBY",
     IN_GAME = "IN_GAME"
 }
+NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.MENU
 
-NetworkSystem.LIFECYCLE_TOPICS = {
-    PLAYER_DIED = "PLAYER_DIED",
-    PLAYER_LEAVE = "PLAYER_LEAVE",
-    RETURN_TO_LOBBY = "RETURN_TO_LOBBY",
-    PLAYER_LEFT = "PLAYER_LEFT",
-    ENTITY_DESTROY = "ENTITY_DESTROY"
-}
+-- Server tracking (delegates to C++ GameStateMachine for state)
+NetworkSystem.playerSessions = {}      -- Server: clientId -> session data
+NetworkSystem.readyClients = {}        -- Server: set of ready client IDs
+NetworkSystem.joinedClients = {}       -- Server: set of joined client IDs
 
-NetworkSystem.playerSessions = {}
-NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
-
+-- Broadcasting
 NetworkSystem.broadcastTimer = 0
 NetworkSystem.broadcastInterval = 0.10
-NetworkSystem.readyClients = {}
-NetworkSystem.joinedClients = {}
 NetworkSystem.tickCounter = 0
-NetworkSystem.debugAccum = 0
-NetworkSystem.debugSentPlayers = 0
-NetworkSystem.debugSentBullets = 0
-NetworkSystem.debugSentEnemies = 0
-NetworkSystem.debugSentPowerUps = 0
-NetworkSystem.debugSentScores = 0
-NetworkSystem.enableDebugLogs = false
-NetworkSystem.matchBootstrapUntil = 0
 
+-- Client heartbeat
+NetworkSystem.heartbeatTimer = 0
+NetworkSystem.heartbeatInterval = 1.0  -- Send heartbeat every 1 second
+
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
 local function destroyEntitySafe(id)
     if id and ECS.getComponent(id, "Transform") then
+        ECS.sendMessage("PhysicCommand", "DestroyBody:" .. tostring(id) .. ";")
         ECS.destroyEntity(id)
     end
 end
 
 local function nowSeconds()
     return os.clock()
-end
-
-local function isMatchBootstrapActive()
-    return nowSeconds() < (NetworkSystem.matchBootstrapUntil or 0)
-end
-
-local function ensurePlayerSession(clientId)
-    if not clientId then return nil end
-    if not NetworkSystem.playerSessions[clientId] then
-        NetworkSystem.playerSessions[clientId] = {
-            playerId = clientId,
-            entityId = nil,
-            state = NetworkSystem.PLAYER_STATES.IN_LOBBY,
-            ready = false,
-            lastPacketAt = nowSeconds()
-        }
-    end
-    return NetworkSystem.playerSessions[clientId]
-end
-
-local function setPlayerReady(clientId, isReady)
-    local session = ensurePlayerSession(clientId)
-    if not session then return end
-    local ready = (isReady == true)
-    session.ready = ready
-    if ready then
-        NetworkSystem.readyClients[clientId] = true
-    else
-        NetworkSystem.readyClients[clientId] = nil
-    end
-end
-
-local function touchPlayerSession(clientId)
-    local session = ensurePlayerSession(clientId)
-    if session then
-        session.lastPacketAt = nowSeconds()
-    end
-    return session
-end
-
-local function setPlayerState(clientId, state)
-    local session = ensurePlayerSession(clientId)
-    if not session then return end
-    session.state = state
-    session.lastPacketAt = nowSeconds()
-end
-
-local function cleanupPlayerEntity(clientId)
-    local session = ensurePlayerSession(clientId)
-    local playerId = NetworkSystem.clientEntities[clientId]
-    if not playerId and session then
-        playerId = session.entityId
-    end
-
-    if playerId then
-        ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(playerId))
-        ECS.sendMessage("PhysicCommand", "DestroyBody:" .. tostring(playerId) .. ";")
-        destroyEntitySafe(playerId)
-    end
-
-    NetworkSystem.clientEntities[clientId] = nil
-    if session then
-        session.entityId = nil
-    end
-
-    return playerId
-end
-
-local function resetLobbyReadyState(clientId)
-    setPlayerReady(clientId, false)
-    NetworkSystem.joinedClients[clientId] = true
-    if NetworkSystem.pendingClients then
-        NetworkSystem.pendingClients[clientId] = nil
-    end
-end
-
-local function notifyClientReturnToLobby(clientId, reason)
-    ECS.sendToClient(clientId, "RETURN_TO_LOBBY", tostring(reason or "returned_to_lobby"))
-    ECS.sendToClient(clientId, "CLIENT_RESET", "")
-    ECS.sendToClient(clientId, "GAME_WAITING_ROOM", tostring(reason or "returned_to_lobby"))
-end
-
-local function handlePlayerLeaveToLobby(clientId, reason)
-    cleanupPlayerEntity(clientId)
-    setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
-    resetLobbyReadyState(clientId)
-    print("[LOBBY] Player " .. tostring(clientId) .. " returned to lobby")
-    notifyClientReturnToLobby(clientId, reason)
-    ECS.broadcastNetworkMessage("PLAYER_LEFT", tostring(clientId) .. " " .. tostring(reason or "left"))
-end
-
-local function handlePlayerDeathToLobby(clientId, reason)
-    ECS.broadcastNetworkMessage("STOP_MUSIC", "bgm")
-    cleanupPlayerEntity(clientId)
-    setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
-    resetLobbyReadyState(clientId)
-    print("[LOBBY] Player " .. tostring(clientId) .. " returned to lobby")
-    notifyClientReturnToLobby(clientId, reason)
-end
-
-local function hasActiveClients()
-    return next(NetworkSystem.clientEntities) ~= nil
-end
-
-local function hasReadyClients()
-    return next(NetworkSystem.readyClients) ~= nil
-end
-
-local function hasAnyKnownClients()
-    if next(NetworkSystem.clientEntities) ~= nil then return true end
-    if next(NetworkSystem.readyClients) ~= nil then return true end
-    if next(NetworkSystem.joinedClients) ~= nil then return true end
-    if NetworkSystem.pendingClients and next(NetworkSystem.pendingClients) ~= nil then return true end
-    return false
-end
-
-local function hasActivePlayers()
-    return next(NetworkSystem.clientEntities) ~= nil
-end
-
-local function setServerToWaitingRoom(reason)
-    reason = reason or "unspecified"
-
-    NetworkSystem.resetWorldState()
-    -- Force-clear active match entity mapping before lobby setup.
-    NetworkSystem.clientEntities = {}
-    ECS.isGameRunning = false
-    NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
-    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
-
-    -- Clear readiness so lobby must explicitly ready-up again.
-    NetworkSystem.readyClients = {}
-
-    -- Ensure tracked connected sessions are considered lobby participants.
-    for clientId, session in pairs(NetworkSystem.playerSessions) do
-        if session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED then
-            session.state = NetworkSystem.PLAYER_STATES.IN_LOBBY
-            session.entityId = nil
-            session.ready = false
-            NetworkSystem.joinedClients[clientId] = true
-        end
-    end
-
-    -- Ask all connected clients to cleanup gameplay entities and show lobby.
-    ECS.broadcastNetworkMessage("CLIENT_RESET", "")
-    ECS.broadcastNetworkMessage("GAME_WAITING_ROOM", reason)
-
-    print("[LOBBY] Returned to waiting room (reason: " .. tostring(reason) .. ")")
-end
-
-local function countExpectedLobbyPlayers()
-    local count = 0
-    for clientId, session in pairs(NetworkSystem.playerSessions) do
-        if session and session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED then
-            -- Require explicit lobby presence from previous join/return.
-            if NetworkSystem.joinedClients[clientId] then
-                count = count + 1
-            end
-        end
-    end
-
-    -- Fallback for early lifecycle before sessions are fully seeded.
-    if count == 0 then
-        for _ in pairs(NetworkSystem.joinedClients) do
-            count = count + 1
-        end
-    end
-
-    return count
-end
-
-local function maybeStartGameFromLobby()
-    if NetworkSystem.serverGameState ~= NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY then
-        return
-    end
-
-    local joinedCount = countExpectedLobbyPlayers()
-
-    local readyCount = 0
-    for clientId in pairs(NetworkSystem.readyClients) do
-        local session = NetworkSystem.playerSessions[clientId]
-        if (not session or session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED) and NetworkSystem.joinedClients[clientId] then
-            readyCount = readyCount + 1
-        end
-    end
-
-    if joinedCount >= 2 and readyCount >= joinedCount then
-        print("[LOBBY] All players ready -> starting game")
-        ECS.sendMessage("GAME_START", "all_ready")
-    else
-        print("[LOBBY] Lobby readiness: " .. readyCount .. "/" .. joinedCount .. " ready")
-    end
-end
-
-local function spawnReadyLobbyPlayers(reason)
-    reason = reason or "unknown"
-    local spawned = 0
-
-    for clientId in pairs(NetworkSystem.joinedClients) do
-        local session = ensurePlayerSession(clientId)
-        if session and session.state ~= NetworkSystem.PLAYER_STATES.DISCONNECTED and NetworkSystem.readyClients[clientId] then
-            if not NetworkSystem.clientEntities[clientId] then
-                NetworkSystem.spawnPlayerForClient(clientId)
-                spawned = spawned + 1
-            end
-            if NetworkSystem.pendingClients then
-                NetworkSystem.pendingClients[clientId] = nil
-            end
-        end
-    end
-
-    if hasActivePlayers() then
-        ECS.isGameRunning = true
-        local level = resolveCurrentLevel()
-        ECS.broadcastNetworkMessage("LEVEL_CHANGE", tostring(level))
-        local activeCount = 0
-        for _ in pairs(NetworkSystem.clientEntities) do
-            activeCount = activeCount + 1
-        end
-        print("[NetworkSystem] Spawned/validated lobby players for match start (" .. tostring(reason) .. "): active=" .. tostring(activeCount) .. ", spawned=" .. tostring(spawned))
-    else
-        print("[NetworkSystem] No ready lobby players available to spawn (" .. tostring(reason) .. ")")
-    end
-end
-
-local function startMatchFromLobby(reason)
-    reason = reason or "unknown"
-
-    NetworkSystem.matchBootstrapUntil = nowSeconds() + 2.5
-    NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.IN_GAME
-    ECS.isGameRunning = true
-
-    resetLevelToOne()
-    NetworkSystem.resetWorldState()
-
-    local existingClientIds = {}
-    for clientId in pairs(NetworkSystem.clientEntities) do
-        table.insert(existingClientIds, clientId)
-    end
-    for _, clientId in ipairs(existingClientIds) do
-        cleanupPlayerEntity(clientId)
-    end
-
-    spawnReadyLobbyPlayers(reason)
-    ECS.broadcastNetworkMessage("GAME_START", "all_ready")
-    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
-end
-
-local function countActivePlayerEntities()
-    local c = 0
-    for _ in pairs(NetworkSystem.clientEntities) do
-        c = c + 1
-    end
-    return c
-end
-
-local function maybeAbortMatchIfNotEnoughPlayers(reason)
-    if NetworkSystem.serverGameState ~= NetworkSystem.SERVER_GAME_STATES.IN_GAME then
-        return
-    end
-    if countActivePlayerEntities() < 2 then
-        setServerToWaitingRoom(reason or "not_enough_players")
-    end
 end
 
 local function extractVelocity(phys)
@@ -329,7 +65,7 @@ end
 
 local function buildStateData(id, transform, phys, typeNum)
     local enemyTypeComp = ECS.getComponent(id, "EnemyType")
-    local actualType = enemyTypeComp and enemyTypeComp.type or typeNum  -- Use EnemyType for enemies, else passed typeNum
+    local actualType = enemyTypeComp and enemyTypeComp.type or typeNum
     local vx, vy, vz = extractVelocity(phys)
     return {
         id = id,
@@ -362,49 +98,16 @@ local function getScaleForType(typeNum)
     return config.enemy.scale, config.enemy.scale, config.enemy.scale
 end
 
-local function countTableKeys(tbl)
-    local c = 0
-    for _ in pairs(tbl) do c = c + 1 end
-    return c
-end
-
-local function applyRemoteWeaponState(serverId, weaponType, cooldown, duration)
-    local localId = NetworkSystem.serverEntities[tostring(serverId)]
-    if not localId then return end
-
-    local weapon = ECS.getComponent(localId, "Weapon") or Weapon(config.player.weaponCooldown)
-    local profile = ECS.getComponent(localId, "WeaponProfile") or WeaponProfile("STANDARD", config.player.weaponCooldown)
-
-    profile.weaponType = weaponType or "STANDARD"
-    weapon.cooldown = tonumber(cooldown) or weapon.cooldown or config.player.weaponCooldown
-
-    ECS.addComponent(localId, "Weapon", weapon)
-    ECS.addComponent(localId, "WeaponProfile", profile)
-
-    local remaining = tonumber(duration) or 0
-    if remaining > 0 then
-        ECS.addComponent(localId, "PowerUp", {
-            timeRemaining = remaining,
-            originalCooldown = profile.baseCooldown or config.player.weaponCooldown,
-            powerType = profile.weaponType
-        })
-    else
-        ECS.removeComponent(localId, "PowerUp")
-    end
-end
-
 local function resolveCurrentLevel()
     if _G.CurrentLevel then
         return tonumber(_G.CurrentLevel) or 1
     end
-
     local file = io.open("current_level.txt", "r")
     if file then
         local content = file:read("*all")
         file:close()
         return tonumber(content) or 1
     end
-
     return 1
 end
 
@@ -417,21 +120,66 @@ local function resetLevelToOne()
     end
 end
 
+-- ============================================================================
+-- PLAYER SESSION HELPERS (Server-side, lightweight - C++ handles state)
+-- ============================================================================
+local function ensurePlayerSession(clientId)
+    if not clientId then return nil end
+    if not NetworkSystem.playerSessions[clientId] then
+        NetworkSystem.playerSessions[clientId] = {
+            playerId = clientId,
+            entityId = nil,
+            lastPacketAt = nowSeconds()
+        }
+    end
+    return NetworkSystem.playerSessions[clientId]
+end
+
+local function touchPlayerSession(clientId)
+    local session = ensurePlayerSession(clientId)
+    if session then
+        session.lastPacketAt = nowSeconds()
+    end
+    return session
+end
+
+-- ============================================================================
+-- ENTITY CLEANUP (Server-side)
+-- ============================================================================
+local function cleanupPlayerEntity(clientId)
+    local session = ensurePlayerSession(clientId)
+    local playerId = NetworkSystem.clientEntities[clientId]
+    if not playerId and session then
+        playerId = session.entityId
+    end
+
+    if playerId then
+        ECS.broadcastNetworkMessage("ENTITY_DESTROY", tostring(playerId))
+        destroyEntitySafe(playerId)
+    end
+
+    NetworkSystem.clientEntities[clientId] = nil
+    if session then
+        session.entityId = nil
+    end
+
+    return playerId
+end
+
+-- ============================================================================
+-- WORLD STATE RESET (Server-side)
+-- ============================================================================
 function NetworkSystem.resetWorldState()
-    -- Clear lingering gameplay entities so a new client does not spawn into stale hazards.
     local function destroyAndBroadcast(entities)
         for _, id in ipairs(entities) do
             ECS.broadcastNetworkMessage("ENTITY_DESTROY", id)
-            ECS.sendMessage("PhysicCommand", "DestroyBody:" .. id .. ";")
-            ECS.destroyEntity(id)
+            destroyEntitySafe(id)
         end
     end
 
     destroyAndBroadcast(ECS.getEntitiesWith({"Enemy"}))
     destroyAndBroadcast(ECS.getEntitiesWith({"Bullet"}))
     destroyAndBroadcast(ECS.getEntitiesWith({"Bonus"}))
-
-    NetworkSystem.deathAnims = {}
 
     local scoreEntities = ECS.getEntitiesWith({"Score"})
     if #scoreEntities > 0 then
@@ -442,539 +190,9 @@ function NetworkSystem.resetWorldState()
     ECS.sendMessage("RESET_DIFFICULTY", "")
 end
 
-function NetworkSystem.init()
-    -- ========================================================================
-    -- UNIFIED NETWORK SYSTEM: Uses ECS.capabilities instead of direct checks
-    -- ========================================================================
-
-    if ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
-        print("[NetworkSystem] Server Mode - Authoritative Network Sync")
-
-        -- Create Logic Score Entity (only on authority)
-        local scoreEnt = ECS.createEntity()
-        ECS.addComponent(scoreEnt, "Score", Score(0))
-
-        ECS.subscribe("ClientConnected", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-            setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
-            print("Client Connected: " .. clientId)
-
-            -- Check if game is already running
-            local gameStateEntities = ECS.getEntitiesWith({"GameState"})
-            if #gameStateEntities == 0 then
-                print("[NetworkSystem][Server] ERROR: No GameState entity found!")
-                return
-            end
-            local gameState = ECS.getComponent(gameStateEntities[1], "GameState")
-
-            if gameState.state == "PLAYING" then
-                print("  -> Spawning player (GameState: PLAYING)")
-                if not hasActiveClients() then
-                    NetworkSystem.resetWorldState()
-                end
-                if not NetworkSystem.clientEntities[clientId] then
-                    NetworkSystem.spawnPlayerForClient(clientId)
-                end
-                ECS.isGameRunning = true
-            else
-                print("  -> Game not started yet (GameState: " .. gameState.state .. ")")
-
-                -- For dedicated server: Wait for explicit start request
-                -- Store pending client to spawn later when game starts
-                if not NetworkSystem.pendingClients then NetworkSystem.pendingClients = {} end
-                NetworkSystem.pendingClients[clientId] = true
-            end
-        end)
-        
-        ECS.subscribe("CLIENT_READY", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-            NetworkSystem.readyClients[clientId] = true
-            ECS.isGameRunning = true
-            -- Send initial score snapshot
-            local scoreEntities = ECS.getEntitiesWith({"Score"})
-            if #scoreEntities > 0 then
-                local s = ECS.getComponent(scoreEntities[1], "Score")
-                ECS.sendToClient(clientId, "GAME_SCORE", tostring(s.value))
-            end
-            -- Send positions of existing enemies so client renders them right away
-            local enemies = ECS.getEntitiesWith({"Enemy", "Transform"})
-            for _, id in ipairs(enemies) do
-                local t = ECS.getComponent(id, "Transform")
-                local phys = ECS.getComponent(id, "Physic")
-                local data = buildStateData(id, t, phys, 3)
-                if ECS.sendToClientBinary then
-                    ECS.sendToClientBinary(clientId, "ENTITY_POS", data)
-                else
-                    -- Fallback impossible if formatStateMessage is gone, but assuming binary is available
-                end
-            end
-        end)
-
-        ECS.subscribe("PLAYER_READY", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-            setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
-            NetworkSystem.joinedClients[clientId] = true
-            setPlayerReady(clientId, true)
-            print("[LOBBY] Player " .. tostring(clientId) .. " ready = true")
-            maybeStartGameFromLobby()
-        end)
-
-        ECS.subscribe("PLAYER_JOIN", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-            setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_LOBBY)
-            setPlayerReady(clientId, false)
-            NetworkSystem.joinedClients[clientId] = true
-            print("[LOBBY] Player " .. tostring(clientId) .. " joined lobby")
-            maybeStartGameFromLobby()
-        end)
-
-        ECS.subscribe("PLAYER_LEAVE", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-            handlePlayerLeaveToLobby(clientId, "player_leave")
-            print("[NetworkSystem] Client " .. clientId .. " left match via menu")
-            maybeAbortMatchIfNotEnoughPlayers("all_players_left_match")
-        end)
-
-        ECS.subscribe("PLAYER_RETURN_TO_LOBBY", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-            handlePlayerLeaveToLobby(clientId, "returned_to_menu")
-            print("[NetworkSystem] Client " .. clientId .. " returned to lobby")
-            maybeAbortMatchIfNotEnoughPlayers("all_players_left_match")
-        end)
-
-        ECS.subscribe("GAME_START", function(msg)
-            print("[NetworkSystem] GAME_START received from lobby manager")
-            if NetworkSystem.serverGameState == NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY then
-                startMatchFromLobby("game_start")
-            end
-        end)
-
-        ECS.subscribe("RESET_GAME", function(msg)
-            print("DEBUG SERVER: Reset Game Requested")
-            -- Full reset: clear arena and all players/clients to mirror solo restart.
-            NetworkSystem.resetWorldState()
-            for cid, pid in pairs(NetworkSystem.clientEntities) do
-                if pid then
-                    ECS.broadcastNetworkMessage("ENTITY_DESTROY", pid)
-                    ECS.sendMessage("PhysicCommand", "DestroyBody:" .. pid .. ";")
-                    ECS.destroyEntity(pid)
-                end
-                NetworkSystem.clientEntities[cid] = nil
-                setPlayerReady(cid, false)
-                NetworkSystem.joinedClients[cid] = nil
-            end
-            NetworkSystem.pendingClients = {}
-            ECS.isGameRunning = false
-            NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
-            ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
-        end)
-
-        -- When game starts (MENU -> PLAYING), spawn pending clients
-        ECS.subscribe("GAME_STARTED", function(msg)
-            print("[NetworkSystem] Game started - spawning pending clients")
-            NetworkSystem.matchBootstrapUntil = nowSeconds() + 2.5
-            NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.IN_GAME
-            if NetworkSystem.pendingClients then
-                for clientId, _ in pairs(NetworkSystem.pendingClients) do
-                    print("  -> Spawning pending client " .. clientId)
-                    if not hasActiveClients() then
-                        NetworkSystem.resetWorldState()
-                    end
-                    if not NetworkSystem.clientEntities[clientId] then
-                        NetworkSystem.spawnPlayerForClient(clientId)
-                    end
-                end
-                NetworkSystem.pendingClients = {}
-            end
-
-            -- Also spawn ready lobby players in case pending list is empty
-            -- (e.g. GAME_START while state was already PLAYING).
-            spawnReadyLobbyPlayers("game_started")
-        end)
-
-        ECS.subscribe("REQUEST_GAME_START", function(msg)
-            print("[NetworkSystem] Received REQUEST_GAME_START: " .. tostring(msg))
-            local gameStateEntities = ECS.getEntitiesWith({"GameState"})
-            if #gameStateEntities > 0 then
-                local gameState = ECS.getComponent(gameStateEntities[1], "GameState")
-                print("[NetworkSystem] Current GameState: " .. gameState.state)
-                if gameState.state == "MENU" then
-                    print("  -> Starting game upon client request")
-                    resetLevelToOne()
-                    ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
-                    gameState.lastScore = 0
-                end
-            else
-                print("[NetworkSystem] ERROR: No GameState entity found!")
-            end
-        end)
-
-        ECS.subscribe("REQUEST_SPAWN", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if clientId then
-                clientId = tonumber(clientId)
-                touchPlayerSession(clientId)
-                print("Spawn Request from: " .. clientId)
-                if not NetworkSystem.clientEntities[clientId] then
-                    NetworkSystem.spawnPlayerForClient(clientId)
-                else
-                    -- Player already exists, but client is asking (maybe lost packet or restart)
-                    print("Resending PLAYER_ASSIGN to " .. clientId)
-                    ECS.sendToClient(clientId, "PLAYER_ASSIGN", NetworkSystem.clientEntities[clientId])
-                end
-            end
-        end)
-
-        ECS.subscribe("ClientDisconnected", function(msg)
-             local clientId = string.match(msg, "^(%d+)")
-             if not clientId then return end
-             clientId = tonumber(clientId)
-
-             touchPlayerSession(clientId)
-             cleanupPlayerEntity(clientId)
-             setPlayerState(clientId, NetworkSystem.PLAYER_STATES.DISCONNECTED)
-
-             setPlayerReady(clientId, false)
-             NetworkSystem.joinedClients[clientId] = nil
-             if NetworkSystem.pendingClients then
-                 NetworkSystem.pendingClients[clientId] = nil
-             end
-             ECS.broadcastNetworkMessage("PLAYER_LEFT", tostring(clientId) .. " disconnected")
-             print("Client Disconnected: " .. clientId .. " (" .. tostring(msg) .. ")")
-
-             -- When the last client leaves, reset server for a clean replay/start.
-             if not hasAnyKnownClients() then
-                 NetworkSystem.resetWorldState()
-                 ECS.isGameRunning = false
-                 NetworkSystem.serverGameState = NetworkSystem.SERVER_GAME_STATES.WAITING_IN_LOBBY
-                 ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
-                 print("[NetworkSystem] All clients left; reset to MENU")
-             end
-
-             maybeAbortMatchIfNotEnoughPlayers("client_disconnected")
-        end)
-
-        ECS.subscribe("INPUT", function(msg)
-            local clientId, payload = ECS.splitClientIdAndMessage(msg)
-            if clientId and clientId > 0 then
-                touchPlayerSession(clientId)
-            end
-            local data = ECS.unpackMsgPack(payload)
-
-            local key, state = nil, nil
-            if data then
-                -- Binary format {k="KEY", s=1/0}
-                key = data.k
-                state = data.s
-            else
-                -- Legacy text format fallback: "UP 1"
-                -- msg contains "clientId key state" if it wasn't stripped?
-                -- Actually splitClientIdAndMessage returns (id, rest).
-                -- So payload is "key state".
-                local k, s = string.match(payload, "(%w+) (%d)")
-                if k then
-                    key = k
-                    state = tonumber(s)
-                end
-            end
-
-            if clientId and key then
-                if NetworkSystem.clientEntities[clientId] then
-                    local entityId = NetworkSystem.clientEntities[clientId]
-                    local input = ECS.getComponent(entityId, "InputState")
-                    if input then
-                        local pressed = (state == 1 or state == true)
-                        if key == "UP" or key == "Z" or key == "W" then input.up = pressed end
-                        if key == "DOWN" or key == "S" then input.down = pressed end
-                        if key == "LEFT" or key == "Q" or key == "A" then input.left = pressed end
-                        if key == "RIGHT" or key == "D" then input.right = pressed end
-                        if key == "SPACE" then input.shoot = pressed end
-                    end
-                end
-            end
-        end)
-
-        -- Player death notification from LifeSystem to clean server state and stop broadcasts
-        ECS.subscribe("SERVER_PLAYER_DEAD", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-
-            print("[NetworkSystem] Player death from LifeSystem for client " .. clientId)
-
-            handlePlayerDeathToLobby(clientId, "player_dead")
-            maybeAbortMatchIfNotEnoughPlayers("all_players_dead")
-        end)
-
-        -- Client-side explicit death report (e.g. after GAME_OVER/HP sync)
-        ECS.subscribe("PLAYER_DIED", function(msg)
-            local clientId = string.match(msg, "^(%d+)")
-            if not clientId then return end
-            clientId = tonumber(clientId)
-            touchPlayerSession(clientId)
-
-            print("[NetworkSystem] Received PLAYER_DIED from client " .. clientId)
-            handlePlayerDeathToLobby(clientId, "player_died")
-            maybeAbortMatchIfNotEnoughPlayers("all_players_dead")
-        end)
-
-    elseif not ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
-        print("[NetworkSystem] Client Mode - Receiving Network Sync")
-
-        -- Explicitly join lobby once network mode is ready.
-        ECS.sendNetworkMessage("PLAYER_JOIN", "join")
-
-        -- Handle sound events broadcast from server
-        ECS.subscribe("PLAY_SOUND", function(msg)
-            -- msg format: "soundId:path:volume"
-            ECS.sendMessage("SoundPlay", msg)
-        end)
-
-        -- Handle music stop events from server
-        ECS.subscribe("STOP_MUSIC", function(msg)
-            ECS.sendMessage("MusicStop", msg)
-        end)
-
-        ECS.subscribe("LEVEL_CHANGE", function(level)
-        local levelNum = tonumber(level) or 1
-            -- Destroy old background entities before loading new level
-            local backgroundEntities = ECS.getEntitiesWith({"Background"})
-            for _, id in ipairs(backgroundEntities) do
-                ECS.destroyEntity(id)
-            end
-            dofile("assets/scripts/space-shooter/levels/Level-" .. levelNum .. ".lua")
-            ECS.sendMessage("ShowLevelIntro", tostring(levelNum))
-            ScoreSystem.adjustToScreenSize(_G.SCREEN_WIDTH, _G.SCREEN_HEIGHT)
-        end)
-
-        ECS.subscribe("PLAYER_ASSIGN", function(msg)
-            local id = string.match(msg, "([^%s]+)")
-            if id then
-                print(">> Assigned Player ID: " .. id)
-                NetworkSystem.myServerId = id
-                NetworkSystem.clientDeathReported = false
-                NetworkSystem.updateLocalEntity(id, -8, 0, 0, 0, 0, 0, 0, 0, 0, "1")
-                ECS.sendNetworkMessage("ACK", "PLAYER_ASSIGN")
-            end
-        end)
-
-        ECS.subscribe("GAME_OVER", function(msg)
-            if not NetworkSystem.clientDeathReported then
-                NetworkSystem.clientDeathReported = true
-                ECS.sendNetworkMessage("PLAYER_DIED", "dead")
-            end
-        end)
-
-        ECS.subscribe("GAME_START", function(msg)
-            print("[NetworkSystem][Client] GAME_START received")
-            ECS.sendNetworkMessage("ACK", "GAME_START")
-            ECS.isGameRunning = true
-            -- Ensure we have a player assignment in case packet ordering changed.
-            if not NetworkSystem.myServerId then
-                ECS.sendNetworkMessage("REQUEST_SPAWN", "1")
-            end
-
-            -- Fallback: ensure level visuals/background exist even if initial LEVEL_CHANGE was missed.
-            local bgEntities = ECS.getEntitiesWith({"Background"})
-            if #bgEntities == 0 then
-                local levelNum = resolveCurrentLevel()
-                dofile("assets/scripts/space-shooter/levels/Level-" .. levelNum .. ".lua")
-                ECS.sendMessage("ShowLevelIntro", tostring(levelNum))
-                ScoreSystem.adjustToScreenSize(_G.SCREEN_WIDTH, _G.SCREEN_HEIGHT)
-            end
-        end)
-
-        ECS.subscribe("GAME_SCORE", function(msg)
-            local scoreVal = tonumber(msg)
-            if scoreVal then
-                CurrentScore = scoreVal
-                -- Find local score entity and update it
-                local scoreEntities = ECS.getEntitiesWith({"Score"})
-                if #scoreEntities > 0 then
-                    local scoreComp = ECS.getComponent(scoreEntities[1], "Score")
-                    scoreComp.value = scoreVal
-                    ECS.addComponent(scoreEntities[1], "Score", scoreComp)
-                else
-                    local scoreEntity = ECS.createEntity()
-                    ECS.addComponent(scoreEntity, "Score", Score(scoreVal))
-                end
-            end
-        end)
-
-        ECS.subscribe("PLAYER_HP", function(msg)
-            local id, hpStr, maxStr = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)")
-            if not id then return end
-            if id ~= tostring(NetworkSystem.myServerId) then return end
-
-            local hp = tonumber(hpStr)
-            local maxHp = tonumber(maxStr)
-            if not hp or not maxHp then return end
-
-            local localId = NetworkSystem.serverEntities[id]
-            if not localId then return end
-
-            local life = ECS.getComponent(localId, "Life")
-            if not life then
-                life = Life(maxHp)
-            end
-            life.amount = hp
-            life.max = maxHp
-            ECS.addComponent(localId, "Life", life)
-
-            if hp <= 0 and not NetworkSystem.clientDeathReported then
-                NetworkSystem.clientDeathReported = true
-                ECS.sendNetworkMessage("PLAYER_DIED", "hp_zero")
-            end
-        end)
-
-        ECS.subscribe("PLAYER_POWERUP", function(msg)
-            local id, pType, duration = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)")
-            if not id or not pType then return end
-
-            local cooldown = config.player.weaponCooldown
-            if pType == "RAPID" then
-                cooldown = 0.1
-            elseif pType == "SPREAD" then
-                cooldown = 0.22
-            elseif pType == "BURST" then
-                cooldown = 0.28
-            end
-
-            applyRemoteWeaponState(id, pType, cooldown, duration)
-        end)
-
-        ECS.subscribe("PLAYER_POWERUP_END", function(msg)
-            local id = string.match(msg, "([^%s]+)")
-            if not id then return end
-            applyRemoteWeaponState(id, "STANDARD", config.player.weaponCooldown, 0)
-        end)
-
-        ECS.subscribe("PLAYER_WEAPON", function(msg)
-            local id, pType, cooldown, duration = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)")
-            if not id then return end
-            applyRemoteWeaponState(id, pType, cooldown, duration)
-        end)
-
-        ECS.subscribe("ENTITY_HIT", function(msg)
-        local id = string.match(msg, "([^%s]+)")
-            if id and NetworkSystem.serverEntities[id] then
-                local localId = NetworkSystem.serverEntities[id]
-                local colorComp = ECS.getComponent(localId, "Color")
-                if colorComp then
-                    ECS.addComponent(localId, "HitFlash", { timer = 0.5, originalR = colorComp.r, originalG = colorComp.g, originalB = colorComp.b })
-                    colorComp.r = 1.0
-                    colorComp.g = 0.0
-                    colorComp.b = 0.0
-                end
-            end
-        end)
-
-        ECS.subscribe("ENTITY_POS", function(msg)
-            -- msg can be binary (table) or text (string)
-            if not ECS.isGameRunning then return end
-            
-            local data = ECS.unpackMsgPack(msg)
-            if data then
-                -- Binary table: {id=..., x=..., ...}
-                NetworkSystem.updateLocalEntity(data.id, data.x, data.y, data.z, data.rx, data.ry, data.rz, data.vx, data.vy, data.vz, tostring(data.t))
-            else
-                -- Legacy text: "id x y z ..."
-                local id, x, y, z, rx, ry, rz, vx, vy, vz, type = string.match(msg, "([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+)")
-                if id then
-                    NetworkSystem.updateLocalEntity(id, x, y, z, rx, ry, rz, vx, vy, vz, type)
-                end
-            end
-        end)
-
-        ECS.subscribe("ENTITY_DESTROY", function(msg)
-            local id = string.match(msg, "([^%s]+)")
-            if id and NetworkSystem.serverEntities[id] then
-                destroyEntitySafe(NetworkSystem.serverEntities[id])
-                NetworkSystem.serverEntities[id] = nil
-            end
-        end)
-
-        ECS.subscribe("ENEMY_DEAD", function(msg)
-                if not ECS.isGameRunning then return end
-
-                -- Parse: ID X Y Z VX VY VZ
-                local id, x, y, z = string.match(msg, "([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+)")
-
-                if id then
-                    if x and y and z then
-                        Spawns.createExplosion(tonumber(x), tonumber(y), tonumber(z))
-                    end
-
-                    local existing = NetworkSystem.serverEntities[id]
-                    if existing then
-                        destroyEntitySafe(existing)
-                        NetworkSystem.serverEntities[id] = nil
-                    end
-                end
-        end)
-
-        ECS.subscribe("CLIENT_RESET", function(msg)
-            print("DEBUG CLIENT: Resetting Network State")
-            NetworkSystem.myServerId = nil
-            NetworkSystem.serverEntities = {}
-            NetworkSystem.clientDeathReported = false
-            ECS.isGameRunning = false
-            -- Cleanup any remaining rendered entities to avoid lingering cubes between modes.
-            local cleanupIds = ECS.getEntitiesWith({"Transform"})
-            for _, eid in ipairs(cleanupIds) do
-                -- Preserve UI/menu tags and camera
-                local tag = ECS.getComponent(eid, "Tag")
-                local camera = ECS.getComponent(eid, "Camera")
-                local keep = camera ~= nil
-                if tag and not keep then
-                    for _, t in ipairs(tag.tags) do
-                        if t == "MenuEntity" or t == "GameUI" or t == "GameOverEntity" or t == "ErrorEntity" or t == "LoadingEntity" then
-                            keep = true
-                            break
-                        end
-                    end
-                end
-                if not keep then
-                    destroyEntitySafe(eid)
-                end
-            end
-            -- Entities are destroyed by MenuSystem cleaning tags,
-            -- but clearing the map prevents "ghost" updates.
-        end)
-
-        ECS.subscribe("GAME_WAITING_ROOM", function(msg)
-            ECS.isGameRunning = false
-            -- Ask MenuSystem to open multiplayer lobby/waiting-room screen.
-            ECS.sendMessage("FORCE_WAITING_ROOM", tostring(msg or ""))
-        end)
-
-        ECS.subscribe("RETURN_TO_LOBBY", function(msg)
-            ECS.isGameRunning = false
-            NetworkSystem.clientDeathReported = false
-            ECS.sendMessage("FORCE_WAITING_ROOM", tostring(msg or ""))
-        end)
-    end
-end
-
+-- ============================================================================
+-- PLAYER SPAWNING (Server-side)
+-- ============================================================================
 function NetworkSystem.spawnPlayerForClient(clientId)
     clientId = tonumber(clientId)
     if not clientId then return end
@@ -987,12 +205,15 @@ function NetworkSystem.spawnPlayerForClient(clientId)
     local session = touchPlayerSession(clientId)
     if session then
         session.entityId = player
-        session.playerId = clientId
     end
-    setPlayerState(clientId, NetworkSystem.PLAYER_STATES.IN_GAME)
+
     ECS.sendToClient(clientId, "PLAYER_ASSIGN", tostring(player))
+    print("[NetworkSystem] Spawned player for client " .. clientId .. " -> entity " .. tostring(player))
 end
 
+-- ============================================================================
+-- CLIENT ENTITY UPDATE (Client-side)
+-- ============================================================================
 function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, vz, typeStr)
     local localId = NetworkSystem.serverEntities[serverId]
     local nx, ny, nz = tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0
@@ -1010,85 +231,53 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
         t.netAge = 0
 
         if nType == 1 then
-             -- Try to use numeric ID first, otherwise hash the string
-             local pid = tonumber(serverId)
-             if not pid then
-                 local s = tostring(serverId)
-                 pid = 0
-                 for i = 1, #s do pid = pid + string.byte(s, i) end
-             end
+            local pid = tonumber(serverId) or 0
+            if pid == 0 then
+                local s = tostring(serverId)
+                for i = 1, #s do pid = pid + string.byte(s, i) end
+            end
 
-             -- Unique Mesh per Player
-             local meshe = "assets/models/simple_plane.obj"
+            ECS.addComponent(localId, "Mesh", Mesh("assets/models/simple_plane.obj"))
 
-             ECS.addComponent(localId, "Mesh", Mesh(meshe))
-             -- Unique Color per Player
-             local colors = {
-                {1.0, 0.0, 0.0}, -- Red
-                {0.0, 1.0, 0.0}, -- Green
-                {0.0, 0.0, 1.0}, -- Blue
-                {1.0, 1.0, 0.0}, -- Yellow
-                {1.0, 0.0, 1.0}, -- Magenta
-                {0.0, 1.0, 1.0}, -- Cyan
-                {1.0, 0.5, 0.0}, -- Orange
-                {0.5, 0.0, 1.0}, -- Purple
-             }
-             local colorIndex = ((pid * 7) % #colors) + 1
-             local col = colors[colorIndex]
+            local colors = {
+                {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}, {1.0, 1.0, 0.0},
+                {1.0, 0.0, 1.0}, {0.0, 1.0, 1.0}, {1.0, 0.5, 0.0}, {0.5, 0.0, 1.0}
+            }
+            local colorIndex = ((pid * 7) % #colors) + 1
+            local col = colors[colorIndex]
+            ECS.addComponent(localId, "Color", Color(col[1], col[2], col[3]))
 
-             ECS.addComponent(localId, "Color", Color(col[1], col[2], col[3]))
+            t.sx, t.sy, t.sz = getScaleForType(1)
+            t.rx, t.ry, t.rz = 0, 0, 0
 
-             local t = ECS.getComponent(localId, "Transform")
-                if t then
-                    t.sx, t.sy, t.sz = getScaleForType(1)
-                    -- Keep player visually stable; server-authoritative gameplay does not need ship spin.
-                    t.rx = 0
-                    t.ry = 0
-                    t.rz = 0
-                end
-             -- Reactor Particles (Blue Trail) for ALL players (Local and Remote)
-             ECS.addComponent(localId, "ParticleGenerator", ParticleGenerator(
-                -1.0, 0, 0,   -- Offset (Behind)
-                -1, 0, 0,     -- Direction (Backwards)
-                0.2,          -- Spread
-                2.0,          -- Speed
-                0.5,          -- LifeTime
-                50.0,         -- Rate
-                0.1,          -- Size
-                0.0, 0.5, 1.0 -- Color (Blue)
-             ))
+            ECS.addComponent(localId, "ParticleGenerator", ParticleGenerator(
+                -1.0, 0, 0, -1, 0, 0, 0.2, 2.0, 0.5, 50.0, 0.1, 0.0, 0.5, 1.0
+            ))
 
-             -- If this is ME, add prediction components so InputSystem can drive it locally
-             if serverId == NetworkSystem.myServerId then
-                 ECS.addComponent(localId, "InputState", { up=false, down=false, left=false, right=false, shoot=false })
-                 ECS.addComponent(localId, "Player", Player(config.player.speed))
-                 ECS.addComponent(localId, "Weapon", Weapon(config.player.weaponCooldown))
-                 ECS.addComponent(localId, "Physic", Physic(1.0, 0.0, false, false))
-                 ECS.addComponent(localId, "Life", Life(100))
-                 -- We do NOT add Collider yet, to avoid local collision resolution conflicts.
-                 -- We trust the server for collisions.
-             end
+            if serverId == NetworkSystem.myServerId then
+                ECS.addComponent(localId, "InputState", { up=false, down=false, left=false, right=false, shoot=false })
+                ECS.addComponent(localId, "Player", Player(config.player.speed))
+                ECS.addComponent(localId, "Weapon", Weapon(config.player.weaponCooldown))
+                ECS.addComponent(localId, "Physic", Physic(1.0, 0.0, false, false))
+                ECS.addComponent(localId, "Life", Life(100))
+            end
 
         elseif nType == 2 then
-             ECS.addComponent(localId, "Mesh", Mesh("assets/models/sphere.obj", "assets/textures/shoot.jpg"))
-             ECS.addComponent(localId, "Color", Color(0.0, 1.0, 1.0))
-             local t = ECS.getComponent(localId, "Transform")
-             t.sx = 0.2; t.sy = 0.2; t.sz = 0.2
+            ECS.addComponent(localId, "Mesh", Mesh("assets/models/sphere.obj", "assets/textures/shoot.jpg"))
+            ECS.addComponent(localId, "Color", Color(0.0, 1.0, 1.0))
+            t.sx, t.sy, t.sz = 0.2, 0.2, 0.2
         elseif nType == 3 then
             ECS.addComponent(localId, "Mesh", Mesh("assets/models/sphere.obj", "assets/textures/attack.jpg"))
-            ECS.addComponent(localId, "Color", Color(1.0, 0.5, 0.0)) -- Orange
-            local t = ECS.getComponent(localId, "Transform")
-            t.sx = 0.2; t.sy = 0.2; t.sz = 0.2
+            ECS.addComponent(localId, "Color", Color(1.0, 0.5, 0.0))
+            t.sx, t.sy, t.sz = 0.2, 0.2, 0.2
         elseif nType == 99 then
             ECS.addComponent(localId, "Mesh", Mesh("assets/models/Monster_3/motion_1.obj", nil))
             ECS.addComponent(localId, "Color", Color(0.9, 0.1, 0.1))
             ECS.addComponent(localId, "Animation", Animation(8, 0.15, true, "assets/models/Monster_3/motion_"))
-            local t = ECS.getComponent(localId, "Transform")
             t.sx, t.sy, t.sz = getScaleForType(99)
         elseif nType == 61 or nType == 62 or nType == 63 then
             ECS.addComponent(localId, "Mesh", Mesh("assets/models/cube.obj", nil))
             ECS.addComponent(localId, "Tag", Tag({"PowerUp", "Bonus"}))
-
             if nType == 61 then
                 ECS.addComponent(localId, "Color", Color(0.2, 0.8, 1.0))
             elseif nType == 62 then
@@ -1096,8 +285,6 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
             else
                 ECS.addComponent(localId, "Color", Color(1.0, 0.4, 0.2))
             end
-
-            local t = ECS.getComponent(localId, "Transform")
             t.sx, t.sy, t.sz = getScaleForType(nType)
         elseif nType >= 4 then
             local configIndex = nType - 3
@@ -1109,17 +296,15 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
             local cfg = enemyConfigs[configIndex] or enemyConfigs[3]
             ECS.addComponent(localId, "Mesh", Mesh(cfg.mesh, nil))
             ECS.addComponent(localId, "Color", cfg.color)
-
             local animBase = "assets/models/Monster_" .. configIndex .. "/motion_"
             ECS.addComponent(localId, "Animation", Animation(cfg.frames, 0.2, true, animBase))
-            local t = ECS.getComponent(localId, "Transform")
-            t.sx = 0.2; t.sy = 0.2; t.sz = 0.2
+            t.sx, t.sy, t.sz = 0.2, 0.2, 0.2
         end
+
         NetworkSystem.serverEntities[serverId] = localId
     else
         local t = ECS.getComponent(localId, "Transform")
         if t then
-            -- Always drive client-side positions from server, including for my own player (no prediction now).
             t.targetX, t.targetY, t.targetZ = nx, ny, nz
             if nType == 1 then
                 t.targetRX, t.targetRY, t.targetRZ = 0, 0, 0
@@ -1130,133 +315,485 @@ function NetworkSystem.updateLocalEntity(serverId, x, y, z, rx, ry, rz, vx, vy, 
             t.netVX, t.netVY, t.netVZ = nvx, nvy, nvz
             t.netAge = 0
             t.sx, t.sy, t.sz = getScaleForType(nType)
-            if t.x == 0 and t.y == 0 and t.targetX ~= 0 then t.x, t.y, t.z = nx, ny, nz end
+            if t.x == 0 and t.y == 0 and t.targetX ~= 0 then
+                t.x, t.y, t.z = nx, ny, nz
+            end
         end
     end
 
-    -- ENSURE LOCAL PREDICTION COMPONENTS ARE PRESENT
-    -- This handles the case where ENTITY_POS arrives before PLAYER_ASSIGN.
+    -- Ensure local player has input components
     if serverId == NetworkSystem.myServerId and localId then
-         -- local c = ECS.getComponent(localId, "Color")
-         -- if c then c.r = 0.0; c.g = 0.5; c.b = 1.0 end
-
-         if not ECS.hasComponent(localId, "InputState") then
-             ECS.addComponent(localId, "InputState", { up=false, down=false, left=false, right=false, shoot=false })
-             ECS.addComponent(localId, "Player", Player(config.player.speed))
-             ECS.addComponent(localId, "Weapon", Weapon(config.player.weaponCooldown))
-             ECS.addComponent(localId, "Physic", Physic(1.0, 0.0, true, false))
-             ECS.addComponent(localId, "Life", Life(100))
-         end
+        if not ECS.hasComponent(localId, "InputState") then
+            ECS.addComponent(localId, "InputState", { up=false, down=false, left=false, right=false, shoot=false })
+            ECS.addComponent(localId, "Player", Player(config.player.speed))
+            ECS.addComponent(localId, "Weapon", Weapon(config.player.weaponCooldown))
+            ECS.addComponent(localId, "Physic", Physic(1.0, 0.0, true, false))
+            ECS.addComponent(localId, "Life", Life(100))
+        end
     end
 end
 
+-- ============================================================================
+-- INIT
+-- ============================================================================
+function NetworkSystem.init()
+    -- ========================================================================
+    -- SERVER MODE
+    -- ========================================================================
+    if ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
+        print("[NetworkSystem] Server Mode - Game State managed by C++ GameStateMachine")
+
+        -- Create Score Entity
+        local scoreEnt = ECS.createEntity()
+        ECS.addComponent(scoreEnt, "Score", Score(0))
+
+        -- Client connected - C++ GameStateMachine handles state
+        ECS.subscribe("ClientConnected", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            touchPlayerSession(clientId)
+            print("[NetworkSystem] Client connected: " .. clientId)
+        end)
+
+        -- Player joined lobby
+        ECS.subscribe("PLAYER_JOIN", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            touchPlayerSession(clientId)
+            NetworkSystem.joinedClients[clientId] = true
+            print("[NetworkSystem] Player " .. clientId .. " joined lobby")
+        end)
+
+        -- Player ready
+        ECS.subscribe("PLAYER_READY", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            touchPlayerSession(clientId)
+            NetworkSystem.readyClients[clientId] = true
+            print("[NetworkSystem] Player " .. clientId .. " ready")
+        end)
+
+        -- GAME_START from C++ GameStateMachine
+        ECS.subscribe("GAME_START", function(msg)
+            print("[NetworkSystem] GAME_START - Spawning all ready players")
+            ECS.isGameRunning = true
+            resetLevelToOne()
+            NetworkSystem.resetWorldState()
+
+            -- Cleanup any existing player entities
+            for clientId, entityId in pairs(NetworkSystem.clientEntities) do
+                cleanupPlayerEntity(clientId)
+            end
+
+            -- Spawn all ready/joined players
+            for clientId in pairs(NetworkSystem.joinedClients) do
+                if NetworkSystem.readyClients[clientId] then
+                    NetworkSystem.spawnPlayerForClient(clientId)
+                end
+            end
+
+            local levelNum = resolveCurrentLevel()
+            ECS.broadcastNetworkMessage("LEVEL_CHANGE", tostring(levelNum))
+            ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "PLAYING")
+        end)
+
+        -- GAME_END from C++ GameStateMachine
+        ECS.subscribe("GAME_END", function(msg)
+            print("[NetworkSystem] GAME_END - Resetting to lobby")
+            ECS.isGameRunning = false
+
+            -- Cleanup all player entities
+            for clientId, entityId in pairs(NetworkSystem.clientEntities) do
+                cleanupPlayerEntity(clientId)
+            end
+            NetworkSystem.clientEntities = {}
+
+            -- Reset world
+            NetworkSystem.resetWorldState()
+
+            -- Reset ready states (C++ GameStateMachine already reset)
+            NetworkSystem.readyClients = {}
+
+            ECS.sendMessage("REQUEST_GAME_STATE_CHANGE", "MENU")
+        end)
+
+        -- GAME_WAITING_ROOM from C++ GameStateMachine (back to lobby)
+        ECS.subscribe("GAME_WAITING_ROOM", function(msg)
+            print("[NetworkSystem] GAME_WAITING_ROOM - Players returned to lobby")
+            ECS.isGameRunning = false
+            NetworkSystem.readyClients = {}
+        end)
+
+        -- Player left game
+        ECS.subscribe("PLAYER_LEAVE", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            cleanupPlayerEntity(clientId)
+            NetworkSystem.readyClients[clientId] = nil
+            print("[NetworkSystem] Player " .. clientId .. " left")
+        end)
+
+        -- Player died - notify server to update state
+        ECS.subscribe("SERVER_PLAYER_DEAD", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            print("[NetworkSystem] Player " .. clientId .. " died")
+            cleanupPlayerEntity(clientId)
+            ECS.sendMessage("RequestPlayerDied", tostring(clientId))
+        end)
+
+        -- Client reported death
+        ECS.subscribe("PLAYER_DIED", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            print("[NetworkSystem] Player " .. clientId .. " reported death")
+            cleanupPlayerEntity(clientId)
+            ECS.sendMessage("RequestPlayerDied", tostring(clientId))
+        end)
+
+        -- Client disconnected
+        ECS.subscribe("ClientDisconnected", function(msg)
+            local clientId = tonumber(string.match(msg, "^(%d+)"))
+            if not clientId then return end
+            cleanupPlayerEntity(clientId)
+            NetworkSystem.playerSessions[clientId] = nil
+            NetworkSystem.readyClients[clientId] = nil
+            NetworkSystem.joinedClients[clientId] = nil
+            ECS.broadcastNetworkMessage("PLAYER_LEFT", tostring(clientId) .. " disconnected")
+            print("[NetworkSystem] Client " .. clientId .. " disconnected")
+        end)
+
+        -- Input handling (server-authoritative)
+        ECS.subscribe("INPUT", function(msg)
+            local clientId, payload = ECS.splitClientIdAndMessage(msg)
+            if clientId and clientId > 0 then
+                touchPlayerSession(clientId)
+            end
+
+            local data = ECS.unpackMsgPack(payload)
+            local key, state = nil, nil
+            if data then
+                key = data.k
+                state = data.s
+            else
+                local k, s = string.match(payload, "(%w+) (%d)")
+                if k then
+                    key = k
+                    state = tonumber(s)
+                end
+            end
+
+            if clientId and key and NetworkSystem.clientEntities[clientId] then
+                local entityId = NetworkSystem.clientEntities[clientId]
+                local input = ECS.getComponent(entityId, "InputState")
+                if input then
+                    local pressed = (state == 1 or state == true)
+                    if key == "UP" or key == "Z" or key == "W" then input.up = pressed end
+                    if key == "DOWN" or key == "S" then input.down = pressed end
+                    if key == "LEFT" or key == "Q" or key == "A" then input.left = pressed end
+                    if key == "RIGHT" or key == "D" then input.right = pressed end
+                    if key == "SPACE" then input.shoot = pressed end
+                end
+            end
+        end)
+
+    -- ========================================================================
+    -- CLIENT MODE
+    -- ========================================================================
+    elseif not ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
+        print("[NetworkSystem] Client Mode - Receiving Network Sync")
+        NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.LOBBY
+
+        -- Player assignment
+        ECS.subscribe("PLAYER_ASSIGN", function(msg)
+            local id = string.match(msg, "([^%s]+)")
+            if id then
+                print("[NetworkSystem] Assigned player ID: " .. id)
+                NetworkSystem.myServerId = id
+                NetworkSystem.clientDeathReported = false
+                NetworkSystem.updateLocalEntity(id, -8, 0, 0, 0, 0, 0, 0, 0, 0, "1")
+                ECS.sendNetworkMessage("ACK", "PLAYER_ASSIGN")
+            end
+        end)
+
+        -- Game starting (transition from LOBBY)
+        ECS.subscribe("GAME_STARTING", function(msg)
+            print("[NetworkSystem] Game starting...")
+            NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.IN_GAME
+        end)
+
+        -- Game start
+        ECS.subscribe("GAME_START", function(msg)
+            print("[NetworkSystem] GAME_START received")
+            ECS.sendNetworkMessage("ACK", "GAME_START")
+            ECS.isGameRunning = true
+            NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.IN_GAME
+            NetworkSystem.clientDeathReported = false
+
+            if not NetworkSystem.myServerId then
+                ECS.sendNetworkMessage("REQUEST_SPAWN", "1")
+            end
+
+            local bgEntities = ECS.getEntitiesWith({"Background"})
+            if #bgEntities == 0 then
+                local levelNum = resolveCurrentLevel()
+                dofile("assets/scripts/space-shooter/levels/Level-" .. levelNum .. ".lua")
+                ECS.sendMessage("ShowLevelIntro", tostring(levelNum))
+                ScoreSystem.adjustToScreenSize(_G.SCREEN_WIDTH, _G.SCREEN_HEIGHT)
+            end
+        end)
+
+        -- Game end
+        ECS.subscribe("GAME_END", function(msg)
+            print("[NetworkSystem] GAME_END received")
+            ECS.isGameRunning = false
+            NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.LOBBY
+            NetworkSystem.myServerId = nil
+            NetworkSystem.serverEntities = {}
+            NetworkSystem.clientDeathReported = false
+            ECS.sendMessage("FORCE_WAITING_ROOM", "game_ended")
+        end)
+
+        -- Waiting room (lobby)
+        ECS.subscribe("GAME_WAITING_ROOM", function(msg)
+            ECS.isGameRunning = false
+            NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.LOBBY
+            ECS.sendMessage("FORCE_WAITING_ROOM", tostring(msg or ""))
+        end)
+
+        -- Return to lobby
+        ECS.subscribe("RETURN_TO_LOBBY", function(msg)
+            ECS.isGameRunning = false
+            NetworkSystem.clientState = NetworkSystem.CLIENT_STATE.LOBBY
+            NetworkSystem.clientDeathReported = false
+            ECS.sendMessage("FORCE_WAITING_ROOM", tostring(msg or ""))
+        end)
+
+        -- Client reset
+        ECS.subscribe("CLIENT_RESET", function(msg)
+            print("[NetworkSystem] CLIENT_RESET")
+            NetworkSystem.myServerId = nil
+            NetworkSystem.serverEntities = {}
+            NetworkSystem.clientDeathReported = false
+            ECS.isGameRunning = false
+
+            local cleanupIds = ECS.getEntitiesWith({"Transform"})
+            for _, eid in ipairs(cleanupIds) do
+                local tag = ECS.getComponent(eid, "Tag")
+                local camera = ECS.getComponent(eid, "Camera")
+                local keep = camera ~= nil
+                if tag and not keep then
+                    for _, t in ipairs(tag.tags) do
+                        if t == "MenuEntity" or t == "GameUI" or t == "GameOverEntity" then
+                            keep = true
+                            break
+                        end
+                    end
+                end
+                if not keep then
+                    destroyEntitySafe(eid)
+                end
+            end
+        end)
+
+        -- Level change
+        ECS.subscribe("LEVEL_CHANGE", function(level)
+            local levelNum = tonumber(level) or 1
+            local backgroundEntities = ECS.getEntitiesWith({"Background"})
+            for _, id in ipairs(backgroundEntities) do
+                ECS.destroyEntity(id)
+            end
+            dofile("assets/scripts/space-shooter/levels/Level-" .. levelNum .. ".lua")
+            ECS.sendMessage("ShowLevelIntro", tostring(levelNum))
+            ScoreSystem.adjustToScreenSize(_G.SCREEN_WIDTH, _G.SCREEN_HEIGHT)
+        end)
+
+        -- Entity position
+        ECS.subscribe("ENTITY_POS", function(msg)
+            if not ECS.isGameRunning then return end
+            local data = ECS.unpackMsgPack(msg)
+            if data then
+                NetworkSystem.updateLocalEntity(data.id, data.x, data.y, data.z, data.rx, data.ry, data.rz, data.vx, data.vy, data.vz, tostring(data.t))
+            else
+                local id, x, y, z, rx, ry, rz, vx, vy, vz, typeVal = string.match(msg, "([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+)")
+                if id then
+                    NetworkSystem.updateLocalEntity(id, x, y, z, rx, ry, rz, vx, vy, vz, typeVal)
+                end
+            end
+        end)
+
+        -- Entity destroy
+        ECS.subscribe("ENTITY_DESTROY", function(msg)
+            local id = string.match(msg, "([^%s]+)")
+            if id and NetworkSystem.serverEntities[id] then
+                destroyEntitySafe(NetworkSystem.serverEntities[id])
+                NetworkSystem.serverEntities[id] = nil
+            end
+        end)
+
+        -- Enemy dead (with explosion)
+        ECS.subscribe("ENEMY_DEAD", function(msg)
+            if not ECS.isGameRunning then return end
+            local id, x, y, z = string.match(msg, "([^%s]+) ([^%s]+) ([^%s]+) ([^%s]+)")
+            if id then
+                if x and y and z then
+                    Spawns.createExplosion(tonumber(x), tonumber(y), tonumber(z))
+                end
+                if NetworkSystem.serverEntities[id] then
+                    destroyEntitySafe(NetworkSystem.serverEntities[id])
+                    NetworkSystem.serverEntities[id] = nil
+                end
+            end
+        end)
+
+        -- Score update
+        ECS.subscribe("GAME_SCORE", function(msg)
+            local scoreVal = tonumber(msg)
+            if scoreVal then
+                CurrentScore = scoreVal
+                local scoreEntities = ECS.getEntitiesWith({"Score"})
+                if #scoreEntities > 0 then
+                    local scoreComp = ECS.getComponent(scoreEntities[1], "Score")
+                    scoreComp.value = scoreVal
+                else
+                    local scoreEntity = ECS.createEntity()
+                    ECS.addComponent(scoreEntity, "Score", Score(scoreVal))
+                end
+            end
+        end)
+
+        -- Player HP
+        ECS.subscribe("PLAYER_HP", function(msg)
+            local id, hpStr, maxStr = string.match(msg, "([^%s]+)%s+([^%s]+)%s+([^%s]+)")
+            if not id or id ~= tostring(NetworkSystem.myServerId) then return end
+
+            local hp = tonumber(hpStr)
+            local maxHp = tonumber(maxStr)
+            if not hp or not maxHp then return end
+
+            local localId = NetworkSystem.serverEntities[id]
+            if not localId then return end
+
+            local life = ECS.getComponent(localId, "Life") or Life(maxHp)
+            life.amount = hp
+            life.max = maxHp
+            ECS.addComponent(localId, "Life", life)
+
+            if hp <= 0 and not NetworkSystem.clientDeathReported then
+                NetworkSystem.clientDeathReported = true
+                ECS.sendNetworkMessage("PLAYER_DIED", "hp_zero")
+            end
+        end)
+
+        -- Game over
+        ECS.subscribe("GAME_OVER", function(msg)
+            if not NetworkSystem.clientDeathReported then
+                NetworkSystem.clientDeathReported = true
+                ECS.sendNetworkMessage("PLAYER_DIED", "game_over")
+            end
+        end)
+
+        -- Sound events from server
+        ECS.subscribe("PLAY_SOUND", function(msg)
+            ECS.sendMessage("SoundPlay", msg)
+        end)
+
+        ECS.subscribe("STOP_MUSIC", function(msg)
+            ECS.sendMessage("MusicStop", msg)
+        end)
+    end
+end
+
+-- ============================================================================
+-- UPDATE
+-- ============================================================================
 function NetworkSystem.update(dt)
     -- ========================================================================
-    -- CLIENT-SIDE: Interpolation Logic
+    -- CLIENT-SIDE UPDATE
     -- ========================================================================
     if not ECS.capabilities.hasAuthority and ECS.capabilities.hasNetworkSync then
-        if not ECS.isGameRunning then
-            return
+        -- Send heartbeat during IN_GAME
+        if NetworkSystem.clientState == NetworkSystem.CLIENT_STATE.IN_GAME then
+            NetworkSystem.heartbeatTimer = NetworkSystem.heartbeatTimer + dt
+            if NetworkSystem.heartbeatTimer >= NetworkSystem.heartbeatInterval then
+                NetworkSystem.heartbeatTimer = 0
+                ECS.sendNetworkMessage("HEARTBEAT", "ping")
+            end
         end
-        local entities = ECS.getEntitiesWith({"Transform"})
-        local lerpSpeed = 18.0 -- Slightly softened; prediction handles quickness
-        for _, id in ipairs(entities) do
-            -- Skip interpolation for our own player (Client-Side Prediction)
-            local myEntityId = NetworkSystem.myServerId and NetworkSystem.serverEntities[NetworkSystem.myServerId]
-            local isMyPlayer = (myEntityId == id)
 
-            if not isMyPlayer then
-                local t = ECS.getComponent(id, "Transform")
-                if t.targetX then
-                    t.netAge = (t.netAge or 0) + dt
-                    local age = math.min(t.netAge or 0, 0.2)
-                    local predictedX = t.targetX + (t.netVX or 0) * age
-                    local predictedY = t.targetY + (t.netVY or 0) * age
-                    local predictedZ = t.targetZ + (t.netVZ or 0) * age
+        -- Entity interpolation
+        if ECS.isGameRunning then
+            local entities = ECS.getEntitiesWith({"Transform"})
+            local lerpSpeed = 18.0
 
-                    t.x = t.x + (predictedX - t.x) * lerpSpeed * dt
-                    t.y = t.y + (predictedY - t.y) * lerpSpeed * dt
-                    t.z = t.z + (predictedZ - t.z) * lerpSpeed * dt
-                    -- Also interpolate rotation
-                    t.rx = t.rx + (t.targetRX - t.rx) * lerpSpeed * dt
-                    t.ry = t.ry + (t.targetRY - t.ry) * lerpSpeed * dt
-                    t.rz = t.rz + (t.targetRZ - t.rz) * lerpSpeed * dt
-                end
-            else
-                -- Reconciliation for Local Player
-                -- If local prediction diverges too much from server authority, pull it back.
-                local t = ECS.getComponent(id, "Transform")
-                if t and t.targetX then
-                    local dx = t.x - t.targetX
-                    local dy = t.y - t.targetY
-                    local distSq = dx*dx + dy*dy
-                    -- Threshold: 2.0 units (approx 200ms lag at speed 10)
-                    -- If we are farther than that, something is wrong (packet loss/drift).
-                    if distSq > 4.0 then
-                        local correctionSpeed = 5.0 * dt
-                        t.x = t.x + (t.targetX - t.x) * correctionSpeed
-                        t.y = t.y + (t.targetY - t.y) * correctionSpeed
+            for _, id in ipairs(entities) do
+                local myEntityId = NetworkSystem.myServerId and NetworkSystem.serverEntities[NetworkSystem.myServerId]
+                local isMyPlayer = (myEntityId == id)
+
+                if not isMyPlayer then
+                    local t = ECS.getComponent(id, "Transform")
+                    if t.targetX then
+                        t.netAge = (t.netAge or 0) + dt
+                        local age = math.min(t.netAge or 0, 0.2)
+                        local predictedX = t.targetX + (t.netVX or 0) * age
+                        local predictedY = t.targetY + (t.netVY or 0) * age
+                        local predictedZ = t.targetZ + (t.netVZ or 0) * age
+
+                        t.x = t.x + (predictedX - t.x) * lerpSpeed * dt
+                        t.y = t.y + (predictedY - t.y) * lerpSpeed * dt
+                        t.z = t.z + (predictedZ - t.z) * lerpSpeed * dt
+                        t.rx = t.rx + (t.targetRX - t.rx) * lerpSpeed * dt
+                        t.ry = t.ry + (t.targetRY - t.ry) * lerpSpeed * dt
+                        t.rz = t.rz + (t.targetRZ - t.rz) * lerpSpeed * dt
+                    end
+                else
+                    -- Reconciliation for local player
+                    local t = ECS.getComponent(id, "Transform")
+                    if t and t.targetX then
+                        local dx = t.x - t.targetX
+                        local dy = t.y - t.targetY
+                        local distSq = dx*dx + dy*dy
+                        if distSq > 4.0 then
+                            local correctionSpeed = 5.0 * dt
+                            t.x = t.x + (t.targetX - t.x) * correctionSpeed
+                            t.y = t.y + (t.targetY - t.y) * correctionSpeed
+                        end
                     end
                 end
             end
         end
-
         return
     end
 
     -- ========================================================================
-    -- SERVER-SIDE: State Broadcasting Logic
+    -- SERVER-SIDE UPDATE
     -- ========================================================================
     if not ECS.capabilities.hasAuthority or not ECS.capabilities.hasNetworkSync then
         return
     end
 
-    -- Safety net: if match is still marked running but no player entity remains,
-    -- force server back to waiting room even if a death/leave event was missed.
-    if ECS.isGameRunning and NetworkSystem.serverGameState == NetworkSystem.SERVER_GAME_STATES.IN_GAME and not hasActivePlayers() and not isMatchBootstrapActive() then
-        local hasPending = NetworkSystem.pendingClients and next(NetworkSystem.pendingClients) ~= nil
-        if not hasPending then
-            setServerToWaitingRoom("no_active_players_guard")
-            return
-        end
-    end
-
-    if not hasReadyClients() or not ECS.isGameRunning then
+    if not ECS.isGameRunning then
         return
     end
 
     NetworkSystem.broadcastTimer = NetworkSystem.broadcastTimer + dt
     if NetworkSystem.broadcastTimer < NetworkSystem.broadcastInterval then return end
     NetworkSystem.broadcastTimer = 0
-    NetworkSystem.tickCounter = NetworkSystem.tickCounter + 1
+    NetworkSystem.tickCounter = (NetworkSystem.tickCounter + 1) % 30
 
-    -- Keep tickCounter bounded to avoid overflow
-    if NetworkSystem.tickCounter > 30 then
-        NetworkSystem.tickCounter = 0
-    end
-
-    NetworkSystem.debugAccum = NetworkSystem.debugAccum + NetworkSystem.broadcastInterval
-
+    -- Broadcast player positions
     local players = ECS.getEntitiesWith({"Player", "Transform"})
-    if #players > 0 then
-         -- print("DEBUG SERVER: Broadcasting " .. #players .. " Players")
-    else
-         -- print("DEBUG SERVER: No Players found to broadcast")
-    end
-
     for _, id in ipairs(players) do
         local t = ECS.getComponent(id, "Transform")
         local phys = ECS.getComponent(id, "Physic")
         if ECS.broadcastBinary then
             ECS.broadcastBinary("ENTITY_POS", buildStateData(id, t, phys, 1))
-        else
-            -- Should not happen with new engine
         end
-        NetworkSystem.debugSentPlayers = NetworkSystem.debugSentPlayers + 1
     end
 
-    local bullets = ECS.getEntitiesWith({"Bullet", "Transform"})
-    if NetworkSystem.tickCounter % 2 == 0 then -- ~every 0.16s
+    -- Broadcast bullets (every 2nd tick)
+    if NetworkSystem.tickCounter % 2 == 0 then
+        local bullets = ECS.getEntitiesWith({"Bullet", "Transform"})
         for _, id in ipairs(bullets) do
             local t = ECS.getComponent(id, "Transform")
             local phys = ECS.getComponent(id, "Physic")
@@ -1264,66 +801,50 @@ function NetworkSystem.update(dt)
             local isEnemyBullet = false
             if tagComp and tagComp.tags then
                 for _, tag in ipairs(tagComp.tags) do
-                    if tag == "EnemyBullet" then
-                        isEnemyBullet = true
-                        break
-                    end
+                    if tag == "EnemyBullet" then isEnemyBullet = true break end
                 end
             end
             local typeNum = isEnemyBullet and 3 or 2
             if ECS.broadcastBinary then
                 ECS.broadcastBinary("ENTITY_POS", buildStateData(id, t, phys, typeNum))
             end
-            NetworkSystem.debugSentBullets = NetworkSystem.debugSentBullets + 1
         end
     end
 
-    local enemies = ECS.getEntitiesWith({"Enemy", "Transform"})
-    if NetworkSystem.tickCounter % 3 == 0 then -- ~every 0.24s
+    -- Broadcast enemies (every 3rd tick)
+    if NetworkSystem.tickCounter % 3 == 0 then
+        local enemies = ECS.getEntitiesWith({"Enemy", "Transform"})
         for _, id in ipairs(enemies) do
-             local t = ECS.getComponent(id, "Transform")
-             local phys = ECS.getComponent(id, "Physic")
-             if ECS.broadcastBinary then
-                 ECS.broadcastBinary("ENTITY_POS", buildStateData(id, t, phys, 4))
-             end
-             NetworkSystem.debugSentEnemies = NetworkSystem.debugSentEnemies + 1
+            local t = ECS.getComponent(id, "Transform")
+            local phys = ECS.getComponent(id, "Physic")
+            if ECS.broadcastBinary then
+                ECS.broadcastBinary("ENTITY_POS", buildStateData(id, t, phys, 4))
+            end
         end
     end
 
-    local powerUps = ECS.getEntitiesWith({"Bonus", "Transform"})
-    if NetworkSystem.tickCounter % 2 == 0 then -- ~every 0.16s
+    -- Broadcast power-ups (every 2nd tick)
+    if NetworkSystem.tickCounter % 2 == 0 then
+        local powerUps = ECS.getEntitiesWith({"Bonus", "Transform"})
         for _, id in ipairs(powerUps) do
             local t = ECS.getComponent(id, "Transform")
             local phys = ECS.getComponent(id, "Physic")
             if ECS.broadcastBinary then
                 ECS.broadcastBinary("ENTITY_POS", buildStateData(id, t, phys, 61))
             end
-            NetworkSystem.debugSentPowerUps = NetworkSystem.debugSentPowerUps + 1
         end
     end
 
-    -- Periodic debug dump (server side) every ~1s
-    if NetworkSystem.enableDebugLogs and NetworkSystem.debugAccum >= 1.0 then
-        print(string.format("[NetworkSystem][Server] tick=%d players=%d bullets=%d enemies=%d powerups=%d score=%d readyClients=%d", NetworkSystem.tickCounter, NetworkSystem.debugSentPlayers, NetworkSystem.debugSentBullets, NetworkSystem.debugSentEnemies, NetworkSystem.debugSentPowerUps, NetworkSystem.debugSentScores, countTableKeys(NetworkSystem.readyClients)))
-        NetworkSystem.debugAccum = NetworkSystem.debugAccum - 1.0
-        NetworkSystem.debugSentPlayers = 0
-        NetworkSystem.debugSentBullets = 0
-        NetworkSystem.debugSentEnemies = 0
-        NetworkSystem.debugSentPowerUps = 0
-        NetworkSystem.debugSentScores = 0
-    end
-
-    -- Broadcast Score
-    if NetworkSystem.tickCounter % 10 == 0 then -- score every ~1.2s
+    -- Broadcast score (every 10th tick)
+    if NetworkSystem.tickCounter % 10 == 0 then
         local scoreEntities = ECS.getEntitiesWith({"Score"})
         if #scoreEntities > 0 then
             local s = ECS.getComponent(scoreEntities[1], "Score")
             ECS.broadcastNetworkMessage("GAME_SCORE", tostring(s.value))
-            NetworkSystem.debugSentScores = NetworkSystem.debugSentScores + 1
         end
     end
 
-    -- Broadcast each player's HP so clients can update local HUD health bar.
+    -- Broadcast player HP (every 3rd tick)
     if NetworkSystem.tickCounter % 3 == 0 then
         local playerEntities = ECS.getEntitiesWith({"Player", "Life", "NetworkIdentity"})
         for _, id in ipairs(playerEntities) do
@@ -1331,23 +852,6 @@ function NetworkSystem.update(dt)
             local net = ECS.getComponent(id, "NetworkIdentity")
             if life and net and net.uuid then
                 ECS.broadcastNetworkMessage("PLAYER_HP", tostring(net.uuid) .. " " .. tostring(life.amount or 0) .. " " .. tostring(life.max or 100))
-            end
-        end
-    end
-
-    if NetworkSystem.tickCounter % 3 == 0 then
-        local playerEntities = ECS.getEntitiesWith({"Player", "Weapon", "WeaponProfile", "NetworkIdentity"})
-        for _, id in ipairs(playerEntities) do
-            local weapon = ECS.getComponent(id, "Weapon")
-            local profile = ECS.getComponent(id, "WeaponProfile")
-            local power = ECS.getComponent(id, "PowerUp")
-            local net = ECS.getComponent(id, "NetworkIdentity")
-            if weapon and profile and net and net.uuid then
-                local remaining = power and (power.timeRemaining or 0) or 0
-                ECS.broadcastNetworkMessage(
-                    "PLAYER_WEAPON",
-                    tostring(net.uuid) .. " " .. tostring(profile.weaponType or "STANDARD") .. " " .. tostring(weapon.cooldown or config.player.weaponCooldown) .. " " .. tostring(remaining)
-                )
             end
         end
     end

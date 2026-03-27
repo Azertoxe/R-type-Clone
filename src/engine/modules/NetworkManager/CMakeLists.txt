@@ -3,6 +3,8 @@ add_library(NetworkManager SHARED
     NetworkManager.hpp
     LobbyManager.cpp
     LobbyManager.hpp
+    GameStateMachine.cpp
+    GameStateMachine.hpp
     INetworkManager.hpp
     ../IModule.hpp
     ../AModule.hpp

@@ -40,6 +40,7 @@
 #include "../AModule.hpp"
 #include "INetworkManager.hpp"
 #include "LobbyManager.hpp"
+#include "GameStateMachine.hpp"
 
 #include <asio.hpp>
 #include <atomic>
@@ -151,6 +152,15 @@ private:
            std::size_t sizeBytes);
     void reportBandwidthUsage();
 
+  // Game state machine handlers
+  void setupGameStateMachineCallbacks();
+  void onGameStateChanged(GameState oldState, GameState newState);
+  void onPlayerStateChanged(uint32_t playerId, PlayerState oldState, PlayerState newState);
+  void handlePlayerDiedRequest(const std::string &payload);
+  void handlePlayerLeaveRequest(const std::string &payload);
+  void handleHeartbeat(uint32_t clientId);
+  std::chrono::steady_clock::time_point _lastGameStateUpdateTime;
+
   asio::io_context _ioContext;
   std::unique_ptr<WorkGuard> _workGuard;
   std::thread _ioThread;
@@ -210,6 +220,7 @@ private:
   std::chrono::steady_clock::time_point _lastBandwidthReportTime;
 
   LobbyManager _lobbyManager;
+  GameStateMachine _gameStateMachine;
 
   std::atomic<bool> _ioThreadRunning;
 };

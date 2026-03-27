@@ -135,6 +135,8 @@ function MenuSystem.init()
     ECS.subscribe("WindowResized", MenuSystem.onWindowResized)
     ECS.subscribe("SET_GAME_MODE", MenuSystem.onSetGameMode)
     ECS.subscribe("GAME_START", MenuSystem.onGameStart)
+    ECS.subscribe("GAME_STARTING", MenuSystem.onGameStarting)
+    ECS.subscribe("GAME_END", MenuSystem.onGameEnd)
     ECS.subscribe("FORCE_WAITING_ROOM", MenuSystem.onForceWaitingRoom)
     ECS.subscribe("ShowLevelIntro", MenuSystem.onShowLevelIntro)
     _G.SCREEN_WIDTH = SCREEN_WIDTH
@@ -541,6 +543,59 @@ function MenuSystem.onForceWaitingRoom(_)
     MenuSystem.hideMenu()
     MenuSystem.showMultiplayerMenu()
     print("[MenuSystem] Switched to waiting room")
+end
+
+function MenuSystem.onGameStarting(_)
+    -- Game is about to start - could show a "Starting..." message
+    print("[MenuSystem] Game starting...")
+    if ECS.capabilities.hasRendering and isMenuRendered then
+        -- Optional: show "Game Starting..." overlay
+    end
+end
+
+function MenuSystem.onGameEnd(_)
+    -- Game ended - return to lobby
+    print("[MenuSystem] Game ended - returning to lobby")
+    ECS.isGameRunning = false
+    isPaused = false
+    ECS.isPaused = false
+
+    local gsEntities = ECS.getEntitiesWith({"GameState"})
+    if #gsEntities > 0 then
+        local gs = ECS.getComponent(gsEntities[1], "GameState")
+        gs.state = "MENU"
+    end
+
+    ECS.sendMessage("MusicStop", "bgm")
+
+    -- Cleanup game entities
+    local allEntities = ECS.getEntitiesWith({"Transform"})
+    for _, id in ipairs(allEntities) do
+        if not ECS.hasComponent(id, "GameState") and not ECS.hasComponent(id, "Camera") then
+            local tag = ECS.getComponent(id, "Tag")
+            local keep = false
+            if tag then
+                for _, t in ipairs(tag.tags) do
+                    if t == "MenuEntity" or t == "GameUI" then
+                        keep = true
+                        break
+                    end
+                end
+            end
+            if not keep then
+                ECS.destroyEntity(id)
+            end
+        end
+    end
+
+    MenuSystem.hideMenu()
+
+    -- If in multiplayer mode, go back to lobby
+    if ECS.capabilities.hasNetworkSync and not ECS.capabilities.hasAuthority then
+        MenuSystem.showMultiplayerMenu()
+    else
+        MenuSystem.renderMenu()
+    end
 end
 
 -- ============================================================================

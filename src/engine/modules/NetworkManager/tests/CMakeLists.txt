@@ -8,6 +8,8 @@ add_executable(NetworkManagerTests
     ../NetworkManager.hpp
     ../LobbyManager.cpp
     ../LobbyManager.hpp
+    ../GameStateMachine.cpp
+    ../GameStateMachine.hpp
     ../../AModule.cpp
 )
 

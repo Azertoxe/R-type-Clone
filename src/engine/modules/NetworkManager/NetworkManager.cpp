@@ -68,6 +68,9 @@ NetworkManager::NetworkManager(const char *pubEndpoint, const char *subEndpoint)
   _lastTimeoutCheckTime = now;
   _lastOverflowLog = now;
   _lastReliableCheckTime = now;
+  _lastGameStateUpdateTime = now;
+
+  setupGameStateMachineCallbacks();
 }
 
 NetworkManager::~NetworkManager() { cleanup(); }
@@ -110,6 +113,12 @@ void NetworkManager::loop() {
     if (now - _lastReliableCheckTime >= RELIABLE_RESEND_INTERVAL) {
       processReliableResends();
       _lastReliableCheckTime = now;
+    }
+
+    // Update game state machine (server only)
+    if (now - _lastGameStateUpdateTime >= std::chrono::milliseconds(100)) {
+      _gameStateMachine.update();
+      _lastGameStateUpdateTime = now;
     }
   }
 
@@ -218,6 +227,27 @@ void NetworkManager::registerSubscriptions() {
             [this](const std::string &payload) {
               handleSetBandwidthLoggingRequest(payload);
             });
+
+  // Game state management subscriptions (server-side)
+  subscribe("RequestPlayerDied", [this](const std::string &payload) {
+    handlePlayerDiedRequest(payload);
+  });
+
+  subscribe("RequestPlayerLeave", [this](const std::string &payload) {
+    handlePlayerLeaveRequest(payload);
+  });
+
+  subscribe("RequestForceEndGame", [this](const std::string &) {
+    if (_isServer) {
+      _gameStateMachine.forceEndGame();
+    }
+  });
+
+  subscribe("RequestResetToLobby", [this](const std::string &) {
+    if (_isServer) {
+      _gameStateMachine.resetToLobby();
+    }
+  });
 }
 
 void NetworkManager::handleCommandString(const std::string &commandLine) {
@@ -636,17 +666,37 @@ void NetworkManager::processIncomingBuffer(
     if (_isServer) {
       if (envelope.topic == "PLAYER_JOIN") {
         _lobbyManager.onPlayerJoin(clientId);
+        _gameStateMachine.onPlayerJoin(clientId);
         queueBusMessage("PLAYER_JOIN", std::to_string(clientId));
         suppressDefaultBusForward = true;
       } else if (envelope.topic == "PLAYER_READY") {
         _lobbyManager.onPlayerReady(clientId);
+        _gameStateMachine.onPlayerReady(clientId);
         queueBusMessage("PLAYER_READY", std::to_string(clientId));
         suppressDefaultBusForward = true;
-        if (_lobbyManager.shouldStartGame()) {
+
+        // Check if game should start (using new GameStateMachine)
+        if (_gameStateMachine.shouldTransitionToStarting()) {
+          // GameStateMachine will handle the transition in update()
+          // The callback will broadcast GAME_START
+        } else if (_lobbyManager.shouldStartGame()) {
+          // Fallback to legacy LobbyManager behavior
           _lobbyManager.setGameStarted(true);
           broadcast("GAME_START", "all_ready");
           queueBusMessage("GAME_START", "all_ready");
         }
+      } else if (envelope.topic == "PLAYER_LEAVE") {
+        _gameStateMachine.onPlayerLeave(clientId);
+        queueBusMessage("PLAYER_LEAVE", std::to_string(clientId));
+        suppressDefaultBusForward = true;
+      } else if (envelope.topic == "PLAYER_DIED") {
+        _gameStateMachine.onPlayerDied(clientId);
+        queueBusMessage("PLAYER_DIED", std::to_string(clientId));
+        suppressDefaultBusForward = true;
+      } else if (envelope.topic == "HEARTBEAT") {
+        _gameStateMachine.onPlayerHeartbeat(clientId);
+        // Don't forward heartbeats to Lua
+        suppressDefaultBusForward = true;
       }
     }
 
@@ -1126,7 +1176,7 @@ std::vector<NetworkEnvelope> NetworkManager::getAllMessages() {
 
 bool NetworkManager::isReliableTopic(const std::string &topic) const {
   return topic == "PLAYER_ASSIGN" || topic == "GAME_START" ||
-         topic == "NET_PROBE";
+         topic == "GAME_END" || topic == "NET_PROBE";
 }
 
 void NetworkManager::trackReliableMessage(uint32_t clientId,
@@ -1261,6 +1311,86 @@ void NetworkManager::reportBandwidthUsage() {
             << "RECEIVE=" << recvBytes << " B/s "
             << "TOTAL=" << (sendBytes + recvBytes) << " B/s"
             << std::endl;
+}
+
+void NetworkManager::setupGameStateMachineCallbacks() {
+  _gameStateMachine.setStateChangeCallback(
+      [this](GameState oldState, GameState newState) {
+        onGameStateChanged(oldState, newState);
+      });
+
+  _gameStateMachine.setPlayerStateChangeCallback(
+      [this](uint32_t playerId, PlayerState oldState, PlayerState newState) {
+        onPlayerStateChanged(playerId, oldState, newState);
+      });
+}
+
+void NetworkManager::onGameStateChanged(GameState oldState, GameState newState) {
+  std::cout << "[NetworkManager] Game state changed: "
+            << GameStateMachine::stateToString(oldState) << " -> "
+            << GameStateMachine::stateToString(newState) << std::endl;
+
+  if (newState == GameState::STARTING) {
+    // Notify clients that game is starting
+    broadcast("GAME_STARTING", "get_ready");
+    queueBusMessage("GAME_STARTING", "get_ready");
+  } else if (newState == GameState::IN_GAME) {
+    // Game is now in progress - broadcast GAME_START
+    _lobbyManager.setGameStarted(true);
+    broadcast("GAME_START", "all_ready");
+    queueBusMessage("GAME_START", "all_ready");
+  } else if (newState == GameState::ENDING) {
+    // Game ended - broadcast GAME_END and notify Lua
+    broadcast("GAME_END", "game_over");
+    queueBusMessage("GAME_END", "game_over");
+  } else if (newState == GameState::LOBBY) {
+    // Back to lobby - notify clients
+    _lobbyManager.setGameStarted(false);
+    broadcast("GAME_WAITING_ROOM", "reset");
+    queueBusMessage("GAME_WAITING_ROOM", "reset");
+  }
+}
+
+void NetworkManager::onPlayerStateChanged(uint32_t playerId, PlayerState oldState,
+                                          PlayerState newState) {
+  std::cout << "[NetworkManager] Player " << playerId << " state changed: "
+            << GameStateMachine::playerStateToString(oldState) << " -> "
+            << GameStateMachine::playerStateToString(newState) << std::endl;
+
+  // Notify Lua about player state changes
+  std::string stateStr = GameStateMachine::playerStateToString(newState);
+  queueBusMessage("PLAYER_STATE_CHANGED",
+                  std::to_string(playerId) + " " + stateStr);
+
+  if (newState == PlayerState::DEAD) {
+    // Notify all clients about player death
+    broadcast("PLAYER_DIED", std::to_string(playerId));
+  } else if (newState == PlayerState::DISCONNECTED) {
+    // Mark client disconnected in the network layer
+    markClientDisconnected(playerId, "state_change");
+  }
+}
+
+void NetworkManager::handlePlayerDiedRequest(const std::string &payload) {
+  try {
+    uint32_t clientId = static_cast<uint32_t>(std::stoul(trimString(payload)));
+    _gameStateMachine.onPlayerDied(clientId);
+  } catch (const std::exception &) {
+    publishError("PlayerDiedInvalidClientId");
+  }
+}
+
+void NetworkManager::handlePlayerLeaveRequest(const std::string &payload) {
+  try {
+    uint32_t clientId = static_cast<uint32_t>(std::stoul(trimString(payload)));
+    _gameStateMachine.onPlayerLeave(clientId);
+  } catch (const std::exception &) {
+    publishError("PlayerLeaveInvalidClientId");
+  }
+}
+
+void NetworkManager::handleHeartbeat(uint32_t clientId) {
+  _gameStateMachine.onPlayerHeartbeat(clientId);
 }
 
 } // namespace rtypeEngine
